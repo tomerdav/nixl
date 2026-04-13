@@ -374,7 +374,7 @@ endif
 
 # nixl_ep currently lives under examples/device/ep. Build that subtree when
 # either full examples are requested or nixl_ep is explicitly requested.
-if get_option('build_examples') or get_option('build_nixl_ep')
+if get_option('build_examples') or get_option('build_nixl_ep') or get_option('build_device_pingpong')
     subdir('examples')
 endif
 
