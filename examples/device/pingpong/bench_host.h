@@ -4,7 +4,6 @@
 #include "nixl_descriptors.h"
 #include "nixl_types.h"
 #include <cstdint>
-#include <future>
 #include <string>
 
 // ---- Parameter bundle passed to bench_setup -----------------------------------
@@ -17,16 +16,6 @@ struct BenchParams {
     bool is_sender = true;
 };
 
-// ---- In-process rendezvous (single-process mode only) -------------------------
-// Both sender and receiver threads share one instance of this struct.
-// Each side sets its own promise and reads the other's future.
-
-struct BenchRendezvous {
-    std::promise<nixl_blob_t> sender_md_promise;
-    std::promise<nixl_blob_t> recvr_md_promise;
-    std::promise<uintptr_t> sender_addr_promise;
-    std::promise<uintptr_t> recvr_addr_promise;
-};
 
 // ---- Per-side context ---------------------------------------------------------
 
@@ -44,10 +33,13 @@ struct BenchContext {
 
 // ---- API declarations --------------------------------------------------------
 
-// Single-process setup: both sender and receiver call this from their threads.
-// rndv must outlive both calls (owned by the spawning thread).
+// Unified setup for both single-process (loopback) and two-process modes.
+// peer_ip:    IP or hostname of the peer ("127.0.0.1" in single-process mode)
+// peer_port:  the port the peer's listen thread is bound to
+// my_port:    the port this side's listen thread will bind to
 nixl_status_t
-bench_setup_single(BenchContext &ctx, const BenchParams &params, BenchRendezvous &rndv);
+bench_setup(BenchContext &ctx, const BenchParams &params,
+            const char *peer_ip, int peer_port, int my_port);
 
 void
 bench_teardown(BenchContext &ctx);
