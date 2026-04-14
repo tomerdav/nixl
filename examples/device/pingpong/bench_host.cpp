@@ -1,20 +1,22 @@
 #include "bench_host.h"
 
 #include <cuda_runtime.h>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <thread>
-#include <chrono>
+
+// ---- BenchContext::setup -----------------------------------------------------
 
 nixl_status_t
-bench_setup(BenchContext &ctx, const BenchParams &params,
-            const char *peer_ip, int peer_port, int my_port)
+BenchContext::setup(const BenchParams &params,
+                    const char *peer_ip, int peer_port, int my_port)
 {
-    ctx.is_sender = params.is_sender;
-    ctx.gpu_id    = params.gpu_id;
-    ctx.buf_size  = params.msg_size + sizeof(uint64_t);
+    is_sender = params.is_sender;
+    gpu_id    = params.gpu_id;
+    buf_size  = params.msg_size + sizeof(uint64_t);
 
     const std::string my_name   = params.is_sender ? "sender"   : "receiver";
     const std::string peer_name = params.is_sender ? "receiver" : "sender";
@@ -24,39 +26,46 @@ bench_setup(BenchContext &ctx, const BenchParams &params,
 
     // 2. Create NIXL agent with both a progress thread (drives UCX completions)
     //    and a listen thread (accepts incoming TCP metadata connections from peer).
+    //    The constructor throws std::runtime_error if the listen port is in use.
     nixlAgentConfig cfg(/*useProgThread=*/true, /*useListenThread=*/true, my_port);
-    ctx.agent = new nixlAgent(my_name, cfg);
+    try {
+        agent = std::make_unique<nixlAgent>(my_name, cfg);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[%s] nixlAgent construction failed (port %d in use?): %s\n",
+                my_name.c_str(), my_port, e.what());
+        return NIXL_ERR_NOT_FOUND;
+    }
 
     // 3. Create UCX backend
     nixl_b_params_t bparams;
-    nixl_status_t st = ctx.agent->createBackend("UCX", bparams, ctx.ucx_backend);
+    nixl_status_t st = agent->createBackend("UCX", bparams, ucx_backend);
     if (st != NIXL_SUCCESS) {
         fprintf(stderr, "[%s] createBackend failed: %d\n", my_name.c_str(), st);
         return st;
     }
 
     // 4. Allocate and zero device buffers
-    if (cudaMalloc(&ctx.send_buf, ctx.buf_size) != cudaSuccess ||
-        cudaMalloc(&ctx.recv_buf, ctx.buf_size) != cudaSuccess) {
+    if (cudaMalloc(&send_buf, buf_size) != cudaSuccess ||
+        cudaMalloc(&recv_buf, buf_size) != cudaSuccess) {
         fprintf(stderr, "[%s] cudaMalloc failed\n", my_name.c_str());
         return NIXL_ERR_NOT_FOUND;
     }
-    cudaMemset(ctx.send_buf, 0, ctx.buf_size);
-    cudaMemset(ctx.recv_buf, 0, ctx.buf_size);
+    cudaMemset(send_buf, 0, buf_size);
+    cudaMemset(recv_buf, 0, buf_size);
 
     // 5. Register both buffers.
     //    recv_buf must be registered so its UCX rkey is serialised into the
     //    metadata blob; the peer needs that rkey to PUT into our recv_buf.
     nixl_reg_dlist_t send_dlist(VRAM_SEG), recv_dlist(VRAM_SEG);
-    send_dlist.addDesc(nixlBlobDesc((uintptr_t)ctx.send_buf, ctx.buf_size, params.gpu_id, ""));
-    recv_dlist.addDesc(nixlBlobDesc((uintptr_t)ctx.recv_buf, ctx.buf_size, params.gpu_id, ""));
+    send_dlist.addDesc(nixlBlobDesc((uintptr_t)send_buf, buf_size, params.gpu_id, ""));
+    recv_dlist.addDesc(nixlBlobDesc((uintptr_t)recv_buf, buf_size, params.gpu_id, ""));
 
-    st = ctx.agent->registerMem(send_dlist);
+    st = agent->registerMem(send_dlist);
     if (st != NIXL_SUCCESS) {
         fprintf(stderr, "[%s] registerMem(send) failed: %d\n", my_name.c_str(), st);
         return st;
     }
-    st = ctx.agent->registerMem(recv_dlist);
+    st = agent->registerMem(recv_dlist);
     if (st != NIXL_SUCCESS) {
         fprintf(stderr, "[%s] registerMem(recv) failed: %d\n", my_name.c_str(), st);
         return st;
@@ -68,8 +77,8 @@ bench_setup(BenchContext &ctx, const BenchParams &params,
     //    registered buffers. fetchRemoteMD connects to the peer's listen port
     //    and downloads the peer's blob; sendLocalMD connects and uploads ours.
     //
-    //    Sender drives both calls; receiver's listen thread handles them passively
-    //    — no explicit metadata API calls on the receiver side.
+    //    Sender drives both calls; receiver's listen thread handles them
+    //    passively — no explicit metadata API calls on the receiver side.
     nixl_opt_args_t md_args;
     md_args.ipAddr = peer_ip;
     md_args.port   = peer_port;   // peer's listen port
@@ -78,13 +87,13 @@ bench_setup(BenchContext &ctx, const BenchParams &params,
         fprintf(stderr, "[%s] fetching remote MD from %s:%d ...\n",
                 my_name.c_str(), peer_ip, peer_port);
         // Retry: receiver's listen thread may not be ready yet.
-        while ((st = ctx.agent->fetchRemoteMD(peer_name, &md_args)) != NIXL_SUCCESS) {
+        while ((st = agent->fetchRemoteMD(peer_name, &md_args)) != NIXL_SUCCESS) {
             fprintf(stderr, "[%s] fetchRemoteMD not ready (%d), retrying...\n",
                     my_name.c_str(), st);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         fprintf(stderr, "[%s] fetchRemoteMD done, pushing local MD...\n", my_name.c_str());
-        st = ctx.agent->sendLocalMD(&md_args);
+        st = agent->sendLocalMD(&md_args);
         if (st != NIXL_SUCCESS) {
             fprintf(stderr, "[%s] sendLocalMD failed: %d\n", my_name.c_str(), st);
             return st;
@@ -103,17 +112,28 @@ bench_setup(BenchContext &ctx, const BenchParams &params,
     //    loaded locally, so spinning on it is the correct wait for the receiver
     //    (whose listen thread loads the sender's MD asynchronously).
     nixl_blob_t addr_blob(sizeof(uintptr_t), '\0');
-    uintptr_t my_recv_addr = (uintptr_t)ctx.recv_buf;
-    memcpy(&addr_blob[0], &my_recv_addr, sizeof(uintptr_t));
+    auto my_recv_addr = reinterpret_cast<uintptr_t>(recv_buf);
+    memcpy(addr_blob.data(), &my_recv_addr, sizeof(uintptr_t));
+
+    // Wait silently until the listen thread has loaded the peer's metadata.
+    // checkRemoteMD returns NIXL_ERR_NOT_FOUND (without logging) until
+    // remoteBackends_ is populated; genNotif would log ERROR on every retry.
+    nixl_xfer_dlist_t empty_dlist(VRAM_SEG);
+    fprintf(stderr, "[%s] waiting for peer metadata to be ready...\n", my_name.c_str());
+    while (agent->checkRemoteMD(peer_name, empty_dlist) != NIXL_SUCCESS)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    nixl_opt_args_t notif_args;
+    notif_args.backends.push_back(ucx_backend);
 
     fprintf(stderr, "[%s] sending recv_buf addr to peer...\n", my_name.c_str());
-    while ((st = ctx.agent->genNotif(peer_name, addr_blob)) != NIXL_SUCCESS)
+    while ((st = agent->genNotif(peer_name, addr_blob, &notif_args)) != NIXL_SUCCESS)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     fprintf(stderr, "[%s] waiting for peer recv_buf addr...\n", my_name.c_str());
     nixl_notifs_t notifs;
     while (notifs[peer_name].empty()) {
-        ctx.agent->getNotifs(notifs);
+        agent->getNotifs(notifs);
         if (notifs[peer_name].empty())
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -125,43 +145,39 @@ bench_setup(BenchContext &ctx, const BenchParams &params,
     //    local_mvh  — covers our send_buf; the kernel POSTs PUTs from here.
     //    remote_mvh — covers peer's recv_buf; the kernel PUTs into there.
     nixl_local_dlist_t local_send_dlist(VRAM_SEG);
-    local_send_dlist.addDesc(nixlBasicDesc((uintptr_t)ctx.send_buf, ctx.buf_size, params.gpu_id));
+    local_send_dlist.addDesc(nixlBasicDesc((uintptr_t)send_buf, buf_size, params.gpu_id));
 
     nixl_remote_dlist_t remote_dlist(VRAM_SEG);
-    remote_dlist.addDesc(nixlRemoteDesc(peer_recv_addr, ctx.buf_size, params.gpu_id, peer_name));
+    remote_dlist.addDesc(nixlRemoteDesc(peer_recv_addr, buf_size, params.gpu_id, peer_name));
 
-    while ((st = ctx.agent->prepMemView(local_send_dlist, ctx.local_mvh)) != NIXL_SUCCESS) {}
-    while ((st = ctx.agent->prepMemView(remote_dlist,     ctx.remote_mvh)) != NIXL_SUCCESS) {}
+    while ((st = agent->prepMemView(local_send_dlist, local_mvh)) != NIXL_SUCCESS) {}
+    while ((st = agent->prepMemView(remote_dlist,     remote_mvh)) != NIXL_SUCCESS) {}
     fprintf(stderr, "[%s] memory views ready — setup complete\n", my_name.c_str());
 
     return NIXL_SUCCESS;
 }
 
-void
-bench_teardown(BenchContext &ctx)
+// ---- BenchContext::~BenchContext ---------------------------------------------
+
+BenchContext::~BenchContext()
 {
-    if (!ctx.agent) return;
+    if (!agent) return;
 
-    if (ctx.local_mvh)  ctx.agent->releaseMemView(ctx.local_mvh);
-    if (ctx.remote_mvh) ctx.agent->releaseMemView(ctx.remote_mvh);
+    if (local_mvh)  agent->releaseMemView(local_mvh);
+    if (remote_mvh) agent->releaseMemView(remote_mvh);
 
-    // Reconstruct the registration dlists to deregister
-    if (ctx.send_buf && ctx.buf_size > 0) {
+    if (send_buf && buf_size > 0) {
         nixl_reg_dlist_t send_dlist(VRAM_SEG);
-        send_dlist.addDesc(nixlBlobDesc((uintptr_t)ctx.send_buf, ctx.buf_size, ctx.gpu_id, ""));
-        ctx.agent->deregisterMem(send_dlist);
+        send_dlist.addDesc(nixlBlobDesc((uintptr_t)send_buf, buf_size, gpu_id, ""));
+        agent->deregisterMem(send_dlist);
+        cudaFree(send_buf);
     }
-    if (ctx.recv_buf && ctx.buf_size > 0) {
+    if (recv_buf && buf_size > 0) {
         nixl_reg_dlist_t recv_dlist(VRAM_SEG);
-        recv_dlist.addDesc(nixlBlobDesc((uintptr_t)ctx.recv_buf, ctx.buf_size, ctx.gpu_id, ""));
-        ctx.agent->deregisterMem(recv_dlist);
+        recv_dlist.addDesc(nixlBlobDesc((uintptr_t)recv_buf, buf_size, gpu_id, ""));
+        agent->deregisterMem(recv_dlist);
+        cudaFree(recv_buf);
     }
 
-    if (ctx.send_buf) { cudaFree(ctx.send_buf); ctx.send_buf = nullptr; }
-    if (ctx.recv_buf) { cudaFree(ctx.recv_buf); ctx.recv_buf = nullptr; }
-
-    delete ctx.agent;
-    ctx.agent      = nullptr;
-    ctx.local_mvh  = nullptr;
-    ctx.remote_mvh = nullptr;
+    // agent unique_ptr destroyed after this body — agent outlives the cleanup above.
 }
