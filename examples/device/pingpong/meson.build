@@ -27,7 +27,8 @@ nixl_dep = declare_dependency(
     link_with: nixl_lib,
     include_directories: nixl_inc_dirs,
 )
-nixl_lib_dir = join_paths(meson.project_build_root(), 'src', 'core')
+nixl_lib_dir  = join_paths(meson.project_build_root(), 'src', 'core')
+nixl_infra_dir = join_paths(meson.project_build_root(), 'src', 'infra')
 
 pingpong_sources = [
     'bench_main.cpp',
@@ -62,10 +63,10 @@ endif
 
 executable('nixl_device_pingpong',
     pingpong_sources,
-    dependencies: [nixl_dep, cuda_dep] + (ucx_dep.found() ? [ucx_dep] : []),
+    dependencies: [nixl_dep, nixl_infra, cuda_dep] + (ucx_dep.found() ? [ucx_dep] : []),
     include_directories: pingpong_inc_dirs,
     cpp_args: pingpong_cpp_args,
     cuda_args: pingpong_cuda_args,
-    build_rpath: nixl_lib_dir,
+    build_rpath: nixl_lib_dir + ':' + nixl_infra_dir,
     install: false,
 )
