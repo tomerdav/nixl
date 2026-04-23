@@ -12,6 +12,25 @@ wait_sequence_number(volatile uint64_t *counter, uint64_t expected_value) {
 
 template<nixl_gpu_level_t level>
 __device__ static nixl_status_t
+do_put_async(nixlMemViewH local_mvh,
+             nixlMemViewH remote_mvh,
+             size_t total_size,
+             nixlGpuXferStatusH &xfer_status) {
+    nixlMemViewElem src{local_mvh, 0, 0};
+    nixlMemViewElem dst{remote_mvh, 0, 0};
+    nixl_status_t status = nixlPut<level>(src, dst, total_size, 0, 0, &xfer_status);
+    if (status != NIXL_IN_PROG) {
+        if (threadIdx.x == 0) {
+            printf("nixlPut failed with status %d\n", status);
+        }
+        return status;
+    }
+    return status;
+}
+
+
+template<nixl_gpu_level_t level>
+__device__ static nixl_status_t
 do_put_sync(nixlMemViewH local_mvh,
             nixlMemViewH remote_mvh,
             size_t total_size,
@@ -20,19 +39,14 @@ do_put_sync(nixlMemViewH local_mvh,
     nixlMemViewElem dst{remote_mvh, 0, 0};
 
     // Initiate the transfer
-    nixl_status_t status = nixlPut<level>(src, dst, total_size, 0, 0, &xfer_status);
-    if (status != NIXL_IN_PROG) {
-        if (threadIdx.x == 0) {
-            printf("nixlPut failed with status %d\n", status);
-        }
-        return status;
-    }
+    do_put_async<level>(local_mvh, remote_mvh, total_size, xfer_status);
     // Wait for the transfer to complete
     do {
         status = nixlGpuGetXferStatus<level>(xfer_status);
     } while (status == NIXL_IN_PROG);
     return status;
 }
+
 
 template<nixl_gpu_level_t level>
 __global__ void
@@ -71,7 +85,7 @@ nixl_pingpong_latency_kernel(gpu_bench_ctx ctx, uint64_t *elapsed_device) {
             if constexpr (is_warp) {
                 __syncwarp(); // Ensure all threads see the updated counter
             }
-            do_put_sync<level>(ctx.local_mvh, ctx.remote_mvh, total_size, xfer_status);
+            do_put_async<level>(ctx.local_mvh, ctx.remote_mvh, total_size, xfer_status);
 
             if (lane_id == 0) {
                 wait_sequence_number(recv_counter,
@@ -92,7 +106,7 @@ nixl_pingpong_latency_kernel(gpu_bench_ctx ctx, uint64_t *elapsed_device) {
                 *send_counter = i + 1; // Increment send counter to signal the sender
             }
 
-            do_put_sync<level>(ctx.local_mvh, ctx.remote_mvh, total_size, xfer_status);
+            do_put_async<level>(ctx.local_mvh, ctx.remote_mvh, total_size, xfer_status);
         }
     }
 
