@@ -1486,6 +1486,8 @@ void Buffer::_nixl_agent_init() {
 #ifdef NIXL_GPU_DEVICE_BACKEND_PROXY
     init_params["ucx_num_device_channels"] = "1";
     init_params["num_workers"] = std::to_string(proxy_channels);
+    // Peer error handling is incompatible with the host proxy path, otherwise host AMO fail.
+    init_params["ucx_error_handling_mode"] = "none";
 #else
     const char* num_channels_env = std::getenv("NIXL_EP_NUM_CHANNELS");
     init_params["ucx_num_device_channels"] = num_channels_env ? num_channels_env : "4";
