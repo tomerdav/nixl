@@ -1492,9 +1492,9 @@ void Buffer::_nixl_agent_init() {
     const char* num_channels_env = std::getenv("NIXL_EP_NUM_CHANNELS");
     init_params["ucx_num_device_channels"] = num_channels_env ? num_channels_env : "4";
     init_params["num_workers"] = std::to_string(1);
-#endif
     init_params["ucx_error_handling_mode"] = "peer";
     init_params["ucx_ep_close_force"] = "yes";
+#endif
 
     nixlBackendH* ucx_backend = nullptr;
     status = agent->createBackend("UCX", init_params, ucx_backend);
