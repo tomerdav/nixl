@@ -117,6 +117,13 @@ nixlProxySync() {
 
 struct ProxyDeviceContext : nixlProxyDeviceContextData {
 
+    // Channel views are row-major. Validate both dimensions before indexing so an
+    // invalid channel can never alias the next peer's row.
+    __device__ __forceinline__ size_t
+    channelIndex(uint32_t peer_index, uint32_t channel_id) const {
+        return static_cast<size_t>(peer_index) * num_channels + channel_id;
+    }
+
     // Enqueue a transfer submission into the MPSC work ring for the selected
     // channel, spinning if the ring is full.  Optionally records a completion
     // token in *xfer_status for later polling via pollXferStatus().
@@ -127,16 +134,32 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
     // repeatedly touching host memory.
     __device__ inline nixl_status_t
     enqueue(nixlProxySubmission submission, nixlGpuXferStatusH *xfer_status = nullptr) {
-        if (submission.channel_id >= num_channels) {
+        if (submission.dst_index >= peer_capacity || num_channels == 0) {
             return NIXL_ERR_INVALID_PARAM;
         }
+        submission.channel_id %= num_channels;
 
-        nixlProxyChannelView &channel_view = channels[submission.channel_id];
+        cuda::atomic_ref<uint32_t, cuda::thread_scope_system> shut(*shutdown_word);
+        if (shut.load(cuda::memory_order_relaxed) ==
+            static_cast<uint32_t>(nixl_proxy_control_state_t::SHUTDOWN)) {
+            return NIXL_ERR_BACKEND;
+        }
+
+        nixlProxyChannelView &channel_view =
+            channels[channelIndex(submission.dst_index, submission.channel_id)];
+        if (channel_view.work_ring == nullptr || channel_view.completion_slot == nullptr) {
+            return NIXL_ERR_REMOTE_DISCONNECT;
+        }
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> completed_idx(
+            channel_view.completion_slot->completed_idx);
+        (void)completed_idx.load(cuda::memory_order_acquire);
+        if (channel_view.completion_slot->next_status < 0) {
+            return channel_view.completion_slot->next_status;
+        }
         nixlProxyWorkRing *ring = channel_view.work_ring;
 
         cuda::atomic_ref<uint64_t, cuda::thread_scope_device> producer_idx(*ring->producer_idx);
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> cons(*ring->consumer_idx);
-        cuda::atomic_ref<uint32_t, cuda::thread_scope_system> shut(*shutdown_word);
 
         // Atomically claim a unique slot in the ring.
         const uint64_t ticket = producer_idx.fetch_add(1, cuda::memory_order_relaxed);
@@ -163,10 +186,9 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
         submission.op_idx = 0;
         ring->records[slot] = submission;
 
-        // Avoiding system-scope release keeps enqueue from paying
-        // a global GPU memory drain; the CPU worker acquire-polls op_idx
-        // before copying the record.
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_device> record_op_idx(
+        // The CPU worker acquire-polls op_idx, so publication must be system
+        // scoped to make the preceding mapped-host record writes visible.
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> record_op_idx(
             ring->records[slot].op_idx);
         record_op_idx.store(submission_op_idx, cuda::memory_order_release);
 
@@ -189,6 +211,9 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
     __device__ inline nixl_status_t
     pollXferStatus(const nixlGpuXferStatusH &xfer_status) const {
         const ProxyXferStatus *pxs = reinterpret_cast<const ProxyXferStatus *>(xfer_status.storage);
+        if (pxs->slot == nullptr) {
+            return NIXL_ERR_BACKEND;
+        }
 
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> comp_idx(pxs->slot->completed_idx);
 
