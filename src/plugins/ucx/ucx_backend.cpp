@@ -1098,7 +1098,7 @@ nixlUcxEngine::submitProxyRmaWrite(const nixlMetaDesc &local,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    auto *ucx_handle = new nixlUcxBackendReqH(getWorker(worker_id).get(), worker_id);
+    auto *ucx_handle = new nixlUcxBackendReqH(getSharedWorker(worker_id).get(), worker_id);
     handle = ucx_handle;
     ucx_handle->reserve(1);
 
