@@ -130,9 +130,9 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
     // in *xfer_status for later polling via pollXferStatus().
     //
     // producer_idx lives in device memory and only needs device-scope atomicity.
-    // consumer_idx lives in pinned host memory (accessible from device via
-    // UVA mapped pointer). The device cache keeps the non-full path from
-    // repeatedly touching host memory.
+    // The CPU publishes consumer_idx and shutdown through either GDRCopy-backed
+    // HBM or mapped host memory, so their loads remain system-scope; the device
+    // cache keeps the non-full CI path cheap.
     __device__ inline nixl_status_t
     enqueue(nixlProxySubmission submission, nixlGpuXferStatusH *xfer_status = nullptr) {
         if (submission.dst_index >= peer_capacity || num_channels == 0) {
@@ -165,8 +165,8 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
         // Atomically claim a unique slot in the ring.
         const uint64_t ticket = producer_idx.fetch_add(1, cuda::memory_order_relaxed);
 
-        // Fast path: use the device cache. Refresh from host only if the ring
-        // appears full, since mapped-host loads are much slower than HBM loads.
+        // Fast path: use the device cache. Refresh from the authoritative
+        // consumer index only if the ring appears full.
         uint64_t cached_consumer_idx = *ring->consumer_idx_cache;
         while (ticket - cached_consumer_idx >= ring->depth) {
             cached_consumer_idx = cons.load(cuda::memory_order_acquire);

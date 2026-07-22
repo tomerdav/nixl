@@ -22,7 +22,7 @@
 
 ProxyWorker::ProxyWorker(nixlDeviceProxyBackendAdapter *backend,
                          const nixlProxyMemViewRegistry *proxy_memview_registry,
-                         uint32_t *shutdown_word,
+                         uint64_t *shutdown_word,
                          nixlProxyChannelState *channels,
                          std::atomic<nixl_proxy_channel_lifecycle_t> *channel_lifecycle,
                          uint32_t peer_capacity,
@@ -50,7 +50,7 @@ ProxyWorker::start() {
     thread_ = std::thread([this]() {
         NIXL_DEBUG << "ProxyWorker thread " << worker_index_ << " started";
         while (__atomic_load_n(shutdown_word_, __ATOMIC_ACQUIRE) ==
-               static_cast<uint32_t>(nixl_proxy_control_state_t::RUNNING)) {
+               static_cast<uint64_t>(nixl_proxy_control_state_t::RUNNING)) {
             runOnce();
             if (pthr_delay_us_ > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(pthr_delay_us_));
@@ -130,7 +130,7 @@ ProxyWorker::runOnce() {
 
 bool
 ProxyWorker::submitReady(nixlProxyChannelState &channel) {
-    const uint64_t consumer_idx = __atomic_load_n(channel.consumer_idx_host_, __ATOMIC_RELAXED);
+    const uint64_t consumer_idx = channel.consumer_idx_shadow_;
     const uint64_t submit_idx = channel.submit_idx_;
     if (submit_idx - consumer_idx >= channel.ring_depth_) {
         return false;
@@ -201,7 +201,7 @@ ProxyWorker::driveBackendProgress() {
 void
 ProxyWorker::publishCompletions(nixlProxyChannelState &channel) {
     for (;;) {
-        const uint64_t consumer_idx = __atomic_load_n(channel.consumer_idx_host_, __ATOMIC_RELAXED);
+        const uint64_t consumer_idx = channel.consumer_idx_shadow_;
         if (consumer_idx == channel.submit_idx_) {
             break;
         }
@@ -235,6 +235,12 @@ ProxyWorker::publishCompletions(nixlProxyChannelState &channel) {
             }
         }
         front = nixlProxyRequestState{};
-        __atomic_store_n(channel.consumer_idx_host_, consumer_idx + 1, __ATOMIC_RELEASE);
+        if (channel.publishConsumerIdx(consumer_idx + 1) != NIXL_SUCCESS) {
+            NIXL_ERROR << "ProxyWorker::publishCompletions: failed to publish CI"
+                       << " channel=" << channel.device_view.channel_id
+                       << " peer=" << channel.device_view.peer_index
+                       << " consumer_idx=" << consumer_idx + 1;
+            break;
+        }
     }
 }
