@@ -18,6 +18,7 @@
 #define NIXL_SRC_CORE_DEVICE_PROXY_PROXY_WORKER_H
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <thread>
 #include "proxy_protocol.h"
@@ -50,6 +51,15 @@ public:
     runOnce();
 
 private:
+    size_t
+    channelSlot(uint32_t peer, uint32_t channel_id) const {
+        return static_cast<size_t>(channel_id) * peer_capacity_ + peer;
+    }
+
+    /** ACTIVE+allocated after handling RESET_PENDING; otherwise nullptr. */
+    nixlProxyChannelState *
+    activeOwnedSlot(size_t slot);
+
     void
     publishOwnedChannels();
 

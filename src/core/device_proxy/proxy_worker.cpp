@@ -19,7 +19,6 @@
 #include "backend_adapter.h"
 #include "nixl_log.h"
 #include <chrono>
-#include <cuda_runtime.h>
 
 ProxyWorker::ProxyWorker(nixlDeviceProxyBackendAdapter *backend,
                          const nixlProxyMemViewRegistry *proxy_memview_registry,
@@ -68,61 +67,53 @@ ProxyWorker::join() noexcept {
     }
 }
 
+nixlProxyChannelState *
+ProxyWorker::activeOwnedSlot(size_t slot) {
+    nixlProxyChannelState &channel = channels_[slot];
+    const nixl_proxy_channel_lifecycle_t lifecycle =
+        channel_lifecycle_[slot].load(std::memory_order_acquire);
+
+    if (lifecycle == nixl_proxy_channel_lifecycle_t::RESET_PENDING) {
+        channel.resetLocalState();
+        channel_lifecycle_[slot].store(nixl_proxy_channel_lifecycle_t::INACTIVE,
+                                       std::memory_order_release);
+        return nullptr;
+    }
+
+    if (lifecycle != nixl_proxy_channel_lifecycle_t::ACTIVE || !channel.allocated()) {
+        return nullptr;
+    }
+    return &channel;
+}
+
 void
 ProxyWorker::publishOwnedChannels() {
-    // A logical channel has one CPU owner across every dest-rank ring.
     for (uint32_t channel_id = worker_index_; channel_id < channel_count_;
          channel_id += worker_count_) {
         for (uint32_t peer = 0; peer < peer_capacity_; ++peer) {
-            const size_t slot = static_cast<size_t>(channel_id) * peer_capacity_ + peer;
-            nixlProxyChannelState &channel = channels_[slot];
-            const nixl_proxy_channel_lifecycle_t lifecycle =
-                channel_lifecycle_[slot].load(std::memory_order_acquire);
-
-            if (lifecycle == nixl_proxy_channel_lifecycle_t::RESET_PENDING) {
-                channel.resetLocalState();
-                channel_lifecycle_[slot].store(nixl_proxy_channel_lifecycle_t::INACTIVE,
-                                               std::memory_order_release);
+            nixlProxyChannelState *channel = activeOwnedSlot(channelSlot(peer, channel_id));
+            if (channel == nullptr) {
                 continue;
             }
-
-            if (lifecycle != nixl_proxy_channel_lifecycle_t::ACTIVE || !channel.allocated()) {
-                continue;
-            }
-
-            publishCompletions(channel);
+            publishCompletions(*channel);
         }
     }
 }
 
 void
 ProxyWorker::submitOwnedChannels() {
-    // One submit per owned channel_id per runOnce: scan dest rings round-robin
-    // and post at most the first ready record for that channel.
+    if (peer_capacity_ == 0) {
+        return;
+    }
     for (uint32_t channel_id = worker_index_; channel_id < channel_count_;
          channel_id += worker_count_) {
-        if (peer_capacity_ == 0) {
-            continue;
-        }
         for (uint32_t i = 0; i < peer_capacity_; ++i) {
             const uint32_t peer = (submit_rr_peer_ + i) % peer_capacity_;
-            const size_t slot = static_cast<size_t>(channel_id) * peer_capacity_ + peer;
-            nixlProxyChannelState &channel = channels_[slot];
-            const nixl_proxy_channel_lifecycle_t lifecycle =
-                channel_lifecycle_[slot].load(std::memory_order_acquire);
-
-            if (lifecycle == nixl_proxy_channel_lifecycle_t::RESET_PENDING) {
-                channel.resetLocalState();
-                channel_lifecycle_[slot].store(nixl_proxy_channel_lifecycle_t::INACTIVE,
-                                               std::memory_order_release);
+            nixlProxyChannelState *channel = activeOwnedSlot(channelSlot(peer, channel_id));
+            if (channel == nullptr) {
                 continue;
             }
-
-            if (lifecycle != nixl_proxy_channel_lifecycle_t::ACTIVE || !channel.allocated()) {
-                continue;
-            }
-
-            if (submitReady(channel)) {
+            if (submitReady(*channel)) {
                 submit_rr_peer_ = (peer + 1) % peer_capacity_;
                 break;
             }
@@ -139,8 +130,6 @@ ProxyWorker::runOnce() {
 
 bool
 ProxyWorker::submitReady(nixlProxyChannelState &channel) {
-    // Post at most one newly-produced record so the worker advances to the next
-    // owned channel instead of draining one dest ring forever.
     const uint64_t consumer_idx = __atomic_load_n(channel.consumer_idx_host_, __ATOMIC_RELAXED);
     const uint64_t submit_idx = channel.submit_idx_;
     if (submit_idx - consumer_idx >= channel.ring_depth_) {
@@ -149,8 +138,7 @@ ProxyWorker::submitReady(nixlProxyChannelState &channel) {
 
     const uint32_t slot = static_cast<uint32_t>(submit_idx % channel.ring_depth_);
     // The GPU's system-scope release publication pairs with this acquire.
-    const uint64_t op_idx =
-        __atomic_load_n(&channel.records_host_[slot].op_idx, __ATOMIC_ACQUIRE);
+    const uint64_t op_idx = __atomic_load_n(&channel.records_host_[slot].op_idx, __ATOMIC_ACQUIRE);
     if (op_idx == 0) {
         return false;
     }
@@ -204,7 +192,6 @@ ProxyWorker::submitToBackend(nixlProxyChannelState &channel,
 
 void
 ProxyWorker::driveBackendProgress() {
-    // Progress each distinct owned channel_id once (not once per dest ring).
     for (uint32_t channel_id = worker_index_; channel_id < channel_count_;
          channel_id += worker_count_) {
         backend_->progress(channel_id);
@@ -243,11 +230,11 @@ ProxyWorker::publishCompletions(nixlProxyChannelState &channel) {
             channel.completion_slot_host_->next_status = st;
             __atomic_store_n(
                 &channel.completion_slot_host_->completed_idx, front.op_idx, __ATOMIC_RELEASE);
+            if (st != NIXL_SUCCESS) {
+                channel.error_latched = true;
+            }
         }
         front = nixlProxyRequestState{};
         __atomic_store_n(channel.consumer_idx_host_, consumer_idx + 1, __ATOMIC_RELEASE);
-        if (!channel.error_latched && st != NIXL_SUCCESS) {
-            channel.error_latched = true;
-        }
     }
 }
