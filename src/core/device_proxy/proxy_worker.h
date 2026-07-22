@@ -51,9 +51,12 @@ public:
 
 private:
     void
-    handleOwnedChannels(bool publish_completions);
+    publishOwnedChannels();
 
     void
+    submitOwnedChannels();
+
+    bool
     submitReady(nixlProxyChannelState &channel);
 
     void
@@ -77,6 +80,8 @@ private:
     uint32_t worker_index_ = 0;
     uint32_t worker_count_ = 0;
     uint64_t pthr_delay_us_ = 0;
+    /** Round-robin peer cursor for one-submit-per-channel fairness. */
+    uint32_t submit_rr_peer_ = 0;
     std::thread thread_;
 };
 

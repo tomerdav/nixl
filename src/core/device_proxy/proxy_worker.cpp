@@ -49,7 +49,7 @@ ProxyWorker::~ProxyWorker() {
 void
 ProxyWorker::start() {
     thread_ = std::thread([this]() {
-        NIXL_INFO << "ProxyWorker thread " << worker_index_ << " started";
+        NIXL_DEBUG << "ProxyWorker thread " << worker_index_ << " started";
         while (__atomic_load_n(shutdown_word_, __ATOMIC_ACQUIRE) ==
                static_cast<uint32_t>(nixl_proxy_control_state_t::RUNNING)) {
             runOnce();
@@ -57,7 +57,7 @@ ProxyWorker::start() {
                 std::this_thread::sleep_for(std::chrono::microseconds(pthr_delay_us_));
             }
         }
-        NIXL_INFO << "ProxyWorker thread " << worker_index_ << " exiting";
+        NIXL_DEBUG << "ProxyWorker thread " << worker_index_ << " exiting";
     });
 }
 
@@ -69,13 +69,12 @@ ProxyWorker::join() noexcept {
 }
 
 void
-ProxyWorker::handleOwnedChannels(bool publish_completions) {
-    // A logical channel has one CPU owner across every peer.
-    for (uint32_t peer = 0; peer < peer_capacity_; ++peer) {
-        const size_t first = static_cast<size_t>(peer) * channel_count_;
-        for (uint32_t channel_id = worker_index_; channel_id < channel_count_;
-             channel_id += worker_count_) {
-            const size_t slot = first + channel_id;
+ProxyWorker::publishOwnedChannels() {
+    // A logical channel has one CPU owner across every dest-rank ring.
+    for (uint32_t channel_id = worker_index_; channel_id < channel_count_;
+         channel_id += worker_count_) {
+        for (uint32_t peer = 0; peer < peer_capacity_; ++peer) {
+            const size_t slot = static_cast<size_t>(channel_id) * peer_capacity_ + peer;
             nixlProxyChannelState &channel = channels_[slot];
             const nixl_proxy_channel_lifecycle_t lifecycle =
                 channel_lifecycle_[slot].load(std::memory_order_acquire);
@@ -91,10 +90,41 @@ ProxyWorker::handleOwnedChannels(bool publish_completions) {
                 continue;
             }
 
-            if (publish_completions) {
-                publishCompletions(channel);
-            } else {
-                submitReady(channel);
+            publishCompletions(channel);
+        }
+    }
+}
+
+void
+ProxyWorker::submitOwnedChannels() {
+    // One submit per owned channel_id per runOnce: scan dest rings round-robin
+    // and post at most the first ready record for that channel.
+    for (uint32_t channel_id = worker_index_; channel_id < channel_count_;
+         channel_id += worker_count_) {
+        if (peer_capacity_ == 0) {
+            continue;
+        }
+        for (uint32_t i = 0; i < peer_capacity_; ++i) {
+            const uint32_t peer = (submit_rr_peer_ + i) % peer_capacity_;
+            const size_t slot = static_cast<size_t>(channel_id) * peer_capacity_ + peer;
+            nixlProxyChannelState &channel = channels_[slot];
+            const nixl_proxy_channel_lifecycle_t lifecycle =
+                channel_lifecycle_[slot].load(std::memory_order_acquire);
+
+            if (lifecycle == nixl_proxy_channel_lifecycle_t::RESET_PENDING) {
+                channel.resetLocalState();
+                channel_lifecycle_[slot].store(nixl_proxy_channel_lifecycle_t::INACTIVE,
+                                               std::memory_order_release);
+                continue;
+            }
+
+            if (lifecycle != nixl_proxy_channel_lifecycle_t::ACTIVE || !channel.allocated()) {
+                continue;
+            }
+
+            if (submitReady(channel)) {
+                submit_rr_peer_ = (peer + 1) % peer_capacity_;
+                break;
             }
         }
     }
@@ -102,37 +132,39 @@ ProxyWorker::handleOwnedChannels(bool publish_completions) {
 
 void
 ProxyWorker::runOnce() {
-    handleOwnedChannels(/*publish_completions=*/false);
+    submitOwnedChannels();
     driveBackendProgress();
-    handleOwnedChannels(/*publish_completions=*/true);
+    publishOwnedChannels();
 }
 
-void
+bool
 ProxyWorker::submitReady(nixlProxyChannelState &channel) {
-    for (;;) {
-        const uint64_t consumer_idx = __atomic_load_n(channel.consumer_idx_host_, __ATOMIC_RELAXED);
-        const uint64_t submit_idx = channel.submit_idx_;
-        if (submit_idx - consumer_idx >= channel.ring_depth_) {
-            break;
-        }
-
-        const uint32_t slot = static_cast<uint32_t>(submit_idx % channel.ring_depth_);
-        // The GPU's system-scope release publication pairs with this acquire.
-        const uint64_t op_idx =
-            __atomic_load_n(&channel.records_host_[slot].op_idx, __ATOMIC_ACQUIRE);
-        if (op_idx == 0) {
-            break;
-        }
-
-        nixlProxySubmission submission = channel.records_host_[slot];
-        submission.op_idx = op_idx;
-        __atomic_store_n(&channel.records_host_[slot].op_idx, 0, __ATOMIC_RELAXED);
-        submitToBackend(channel, slot, submission);
-        channel.submit_idx_ = submit_idx + 1;
-        NIXL_DEBUG << "ProxyWorker::submitReady: channel=" << channel.device_view.channel_id
-                   << " submit=" << submit_idx << " opcode=" << static_cast<int>(submission.opcode)
-                   << " op_idx=" << submission.op_idx << " size=" << submission.size;
+    // Post at most one newly-produced record so the worker advances to the next
+    // owned channel instead of draining one dest ring forever.
+    const uint64_t consumer_idx = __atomic_load_n(channel.consumer_idx_host_, __ATOMIC_RELAXED);
+    const uint64_t submit_idx = channel.submit_idx_;
+    if (submit_idx - consumer_idx >= channel.ring_depth_) {
+        return false;
     }
+
+    const uint32_t slot = static_cast<uint32_t>(submit_idx % channel.ring_depth_);
+    // The GPU's system-scope release publication pairs with this acquire.
+    const uint64_t op_idx =
+        __atomic_load_n(&channel.records_host_[slot].op_idx, __ATOMIC_ACQUIRE);
+    if (op_idx == 0) {
+        return false;
+    }
+
+    nixlProxySubmission submission = channel.records_host_[slot];
+    submission.op_idx = op_idx;
+    __atomic_store_n(&channel.records_host_[slot].op_idx, 0, __ATOMIC_RELAXED);
+    submitToBackend(channel, slot, submission);
+    channel.submit_idx_ = submit_idx + 1;
+    NIXL_TRACE << "ProxyWorker::submitReady: channel=" << channel.device_view.channel_id
+               << " peer=" << channel.device_view.peer_index << " submit=" << submit_idx
+               << " opcode=" << static_cast<int>(submission.opcode)
+               << " op_idx=" << submission.op_idx << " size=" << submission.size;
+    return true;
 }
 
 void
@@ -145,11 +177,11 @@ ProxyWorker::submitToBackend(nixlProxyChannelState &channel,
     nixl_status_t status =
         proxy_memview_registry_->prepareSubmission(submission, prepared_submission);
     if (status != NIXL_SUCCESS) {
-        NIXL_DEBUG << "ProxyWorker::submitToBackend: submission preparation failed"
+        NIXL_ERROR << "ProxyWorker::submitToBackend: submission preparation failed"
                    << " op_idx=" << submission.op_idx << " status=" << status;
         inflight.status = status;
     } else {
-        NIXL_DEBUG << "ProxyWorker::submitToBackend: op_idx=" << submission.op_idx
+        NIXL_TRACE << "ProxyWorker::submitToBackend: op_idx=" << submission.op_idx
                    << " opcode=" << static_cast<int>(submission.opcode)
                    << " channel=" << submission.channel_id << " local_addr=0x" << std::hex
                    << prepared_submission.local.desc.addr << " remote_addr=0x"
@@ -172,7 +204,11 @@ ProxyWorker::submitToBackend(nixlProxyChannelState &channel,
 
 void
 ProxyWorker::driveBackendProgress() {
-    backend_->progress();
+    // Progress each distinct owned channel_id once (not once per dest ring).
+    for (uint32_t channel_id = worker_index_; channel_id < channel_count_;
+         channel_id += worker_count_) {
+        backend_->progress(channel_id);
+    }
 }
 
 void
@@ -197,7 +233,7 @@ ProxyWorker::publishCompletions(nixlProxyChannelState &channel) {
                 break;
             }
         }
-        NIXL_DEBUG << "ProxyWorker::publishCompletions: channel=" << channel.device_view.channel_id
+        NIXL_TRACE << "ProxyWorker::publishCompletions: channel=" << channel.device_view.channel_id
                    << " op_idx=" << front.op_idx << " status=" << st
                    << " token=" << front.backend_req_token;
 
