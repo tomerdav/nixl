@@ -1140,11 +1140,20 @@ nixlUcxEngine::submitProxyAtomicAdd(const nixlMetaDesc &remote,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    auto *ucx_handle = new nixlUcxBackendReqH(getSharedWorker(worker_id).get(), worker_id);
+    const auto &worker = getSharedWorker(worker_id);
+    auto &ep = rmd->conn->getEp(worker_id);
+
+    // UCP does not enforce order between RMA and AMO. Fence this worker so prior puts on this EP
+    // complete remotely before the atomic becomes visible (write-before-atomic).
+    const nixl_status_t fence_status = worker->fence();
+    if (fence_status != NIXL_SUCCESS) {
+        return fence_status;
+    }
+
+    auto *ucx_handle = new nixlUcxBackendReqH(worker.get(), worker_id);
     handle = ucx_handle;
     ucx_handle->reserve(1);
 
-    auto &ep = rmd->conn->getEp(worker_id);
     nixlUcxReq req = nullptr;
     const nixl_status_t submit_status =
         ep->atomicAdd(value, static_cast<uint64_t>(remote.addr), rmd->getRkey(worker_id), req);

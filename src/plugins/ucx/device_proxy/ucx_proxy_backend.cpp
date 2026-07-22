@@ -91,7 +91,8 @@ nixl_status_t
 nixlUcxProxyBackendAdapter::submitAtomicAdd(const nixlBackendProxySubmission &submission,
                                             uint64_t &request_token) {
     // Same channel -> worker mapping as submitPut so a channel's put and its follow-up
-    // atomic flag travel the same worker/EP/QP, preserving IB write-before-atomic order.
+    // atomic share one worker/EP. submitProxyAtomicAdd fences that worker before the AMO
+    // (UCP does not otherwise order RMA before AMO).
     const size_t worker_id = workerIdForChannel(submission.channel_id);
 
     nixlBackendReqH *handle = nullptr;

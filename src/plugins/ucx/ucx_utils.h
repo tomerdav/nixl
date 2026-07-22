@@ -221,6 +221,9 @@ public:
     progressLoop();
 
     [[nodiscard]] nixl_status_t
+    fence();
+
+    [[nodiscard]] nixl_status_t
     test(nixlUcxReq req);
 
     void

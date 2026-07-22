@@ -716,6 +716,11 @@ nixlUcxWorker::progressLoop() {
 }
 
 nixl_status_t
+nixlUcxWorker::fence() {
+    return nixl::ucx::ucsToNixlStatus(ucp_worker_fence(worker.get()));
+}
+
+nixl_status_t
 nixlUcxWorker::test(nixlUcxReq req) {
     if (req == nullptr) {
         return NIXL_SUCCESS;
