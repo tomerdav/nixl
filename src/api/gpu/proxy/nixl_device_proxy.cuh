@@ -140,27 +140,16 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
         }
         submission.channel_id = static_cast<uint16_t>(submission.channel_id % num_channels);
 
-        cuda::atomic_ref<uint32_t, cuda::thread_scope_system> shut(*shutdown_word);
-        if (shut.load(cuda::memory_order_relaxed) ==
-            static_cast<uint32_t>(nixl_proxy_control_state_t::SHUTDOWN)) {
-            return NIXL_ERR_BACKEND;
-        }
-
         nixlProxyChannelView &channel_view =
             channels[channelIndex(submission.dst_index, submission.channel_id)];
         if (channel_view.work_ring == nullptr || channel_view.completion_slot == nullptr) {
             return NIXL_ERR_REMOTE_DISCONNECT;
         }
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> completed_idx(
-            channel_view.completion_slot->completed_idx);
-        (void)completed_idx.load(cuda::memory_order_acquire);
-        if (channel_view.completion_slot->next_status < 0) {
-            return channel_view.completion_slot->next_status;
-        }
         nixlProxyWorkRing *ring = channel_view.work_ring;
 
         cuda::atomic_ref<uint64_t, cuda::thread_scope_device> producer_idx(*ring->producer_idx);
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> cons(*ring->consumer_idx);
+        cuda::atomic_ref<uint32_t, cuda::thread_scope_system> shut(*shutdown_word);
 
         // Atomically claim a unique slot in the ring.
         const uint64_t ticket = producer_idx.fetch_add(1, cuda::memory_order_relaxed);
