@@ -333,6 +333,7 @@ class Buffer:
         num_experts: Optional[int] = None,
         cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
         dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+        dispatch_put_cost_stats: Optional[torch.Tensor] = None,
         use_fp8: bool = True,
         round_scale: bool = False,
         use_ue8m0: bool = False,
@@ -362,6 +363,9 @@ class Buffer:
             dispatch_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
                 which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
                 This is useful for detecting and pre-cisely localizing slow anomalies.
+            dispatch_put_cost_stats: optional sample buffer for dispatch `nixlPut` issue latency, typed as
+                `torch.int64` with layout
+                `[count, ring_backpressure, total_0, ticket_0, write_0, publication_0, ...]`.
             use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
             round_scale: whether round the scaling factors into power of 2.
             use_ue8m0: whether use UE8M0 as scaling factor format (available only with `round_scale=True`).
@@ -402,6 +406,7 @@ class Buffer:
             topk_idx,
             cumulative_local_expert_recv_stats,
             dispatch_wait_recv_cost_stats,
+            dispatch_put_cost_stats,
             num_max_dispatch_tokens_per_rank,
             use_fp8,
             round_scale,
@@ -424,6 +429,7 @@ class Buffer:
             packed_recv_src_info,
             packed_recv_layout_range,
             cumulative_local_expert_recv_stats,
+            dispatch_put_cost_stats,
         )
         return (
             (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,

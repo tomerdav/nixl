@@ -243,6 +243,7 @@ public:
     dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                          const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                          const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
+                         const std::optional<torch::Tensor>& dispatch_put_cost_stats,
                          int num_max_dispatch_tokens_per_rank,
                          bool use_fp8, bool round_scale, bool use_ue8m0,
                          bool async, bool return_recv_hook);

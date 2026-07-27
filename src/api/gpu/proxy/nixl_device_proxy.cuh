@@ -130,11 +130,13 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
     // in *xfer_status for later polling via pollXferStatus().
     //
     // producer_idx lives in device memory and only needs device-scope atomicity.
-    // consumer_idx lives in pinned host memory (accessible from device via
-    // UVA mapped pointer). The device cache keeps the non-full path from
-    // repeatedly touching host memory.
+    // The CPU publishes consumer_idx and shutdown through either GDRCopy-backed
+    // HBM or mapped host memory. The device cache keeps the non-full consumer
+    // path cheap.
     __device__ inline nixl_status_t
-    enqueue(nixlProxySubmission submission, nixlGpuXferStatusH *xfer_status = nullptr) {
+    enqueue(nixlProxySubmission submission,
+            nixlGpuXferStatusH *xfer_status = nullptr,
+            nixlGpuPutStats *stats = nullptr) {
         if (submission.dst_index >= peer_capacity || num_channels == 0) {
             return NIXL_ERR_INVALID_PARAM;
         }
@@ -157,12 +159,22 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> cons(*ring->consumer_idx);
 
         // Atomically claim a unique slot in the ring.
+        const uint64_t ticket_claim_start = stats != nullptr ? clock64() : 0;
         const uint64_t ticket = producer_idx.fetch_add(1, cuda::memory_order_relaxed);
+        if (stats != nullptr) {
+            stats->ticket_claim_cycles = clock64() - ticket_claim_start;
+        }
 
-        // Fast path: use the device cache. Refresh from host only if the ring
-        // appears full, since mapped-host loads are much slower than HBM loads.
+        // Fast path: use the device cache. Refresh from the authoritative
+        // consumer index only if the ring appears full.
+        // The first entry may only reflect a stale cache. Count backpressure
+        // after the refreshed authoritative consumer index is still full.
+        uint32_t wait_entries = 0;
         uint64_t cached_consumer_idx = *ring->consumer_idx_cache;
         while (ticket - cached_consumer_idx >= ring->depth) {
+            if (++wait_entries == 2 && stats != nullptr) {
+                stats->ring_backpressure = 1;
+            }
             cached_consumer_idx = cons.load(cuda::memory_order_acquire);
             *ring->consumer_idx_cache = cached_consumer_idx;
 
@@ -178,14 +190,22 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
         // Signal this slot is ready for the consumer.  The release
         // guarantees the record write above is visible before the
         // consumer reads op_idx via an acquire load. op_idx == 0 means empty.
+        const uint64_t submission_write_start = stats != nullptr ? clock64() : 0;
         submission.op_idx = 0;
         ring->records[slot] = submission;
+        if (stats != nullptr) {
+            stats->submission_write_cycles = clock64() - submission_write_start;
+        }
 
         // The CPU worker acquire-polls op_idx, so publication must be system
         // scoped to make the preceding mapped-host record writes visible.
+        const uint64_t publication_start = stats != nullptr ? clock64() : 0;
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> record_op_idx(
             ring->records[slot].op_idx);
         record_op_idx.store(submission_op_idx, cuda::memory_order_release);
+        if (stats != nullptr) {
+            stats->publication_cycles = clock64() - publication_start;
+        }
 
         if (xfer_status != nullptr) {
             ProxyXferStatus pxs{channel_view.completion_slot, submission_op_idx};

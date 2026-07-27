@@ -105,7 +105,9 @@ put(const nixlMemViewElem &src,
     size_t size,
     unsigned channel_id = 0,
     uint64_t flags = 0,
-    nixlGpuXferStatusH *xfer_status = nullptr) {
+    nixlGpuXferStatusH *xfer_status = nullptr,
+    nixlGpuPutStats *stats = nullptr) {
+    (void)stats;
     auto src_mem_list = local_mem_list(src.mvh);
     auto dst_mem_list = remote_mem_list(dst.mvh);
     const auto status = ucp_device_put<UcpDeviceLevel<level>::value>(src_mem_list,

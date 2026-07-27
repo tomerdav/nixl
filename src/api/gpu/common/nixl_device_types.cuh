@@ -38,4 +38,16 @@ struct nixlMemViewElem {
     size_t offset; /**< Offset within the buffer */
 };
 
+/** Optional per-put diagnostics filled by the GPU put path (proxy backend). */
+struct nixlGpuPutStats {
+    /** Set to 1 when enqueue waited on a host-confirmed full work ring. */
+    uint32_t ring_backpressure = 0;
+    /** GPU cycles spent atomically claiming a proxy-ring ticket. */
+    uint64_t ticket_claim_cycles = 0;
+    /** GPU cycles spent writing the proxy-ring submission record. */
+    uint64_t submission_write_cycles = 0;
+    /** GPU cycles spent publishing the record to the proxy worker. */
+    uint64_t publication_cycles = 0;
+};
+
 #endif // NIXL_SRC_API_GPU_COMMON_NIXL_DEVICE_TYPES_CUH

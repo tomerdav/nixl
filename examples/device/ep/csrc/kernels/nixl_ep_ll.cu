@@ -76,6 +76,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int* mask_buffer_ptr,
          int* cumulative_local_expert_recv_stats,
          int64_t* dispatch_wait_recv_cost_stats,
+         int64_t* dispatch_put_cost_stats, int dispatch_put_cost_stats_capacity,
          void* rdma_recv_x, uint64_t* rdma_recv_count, void* rdma_x,
          const void* x, const topk_idx_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
@@ -199,8 +200,38 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     if (dst_p2p_ptr == 0) {
                         nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(src_ptr)};
                         nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
+                        const bool record_put = dispatch_put_cost_stats != nullptr;
+                        const long long put_start = record_put ? clock64() : 0;
+                        nixlGpuPutStats put_stats{};
                         EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(src_mdesc, dst_mdesc, num_bytes_per_msg,
-                                dst_expert_local_idx, doorbell_flag(slot_idx)) == NIXL_IN_PROG);
+                                dst_expert_local_idx, doorbell_flag(slot_idx), nullptr,
+                                record_put ? &put_stats : nullptr) == NIXL_IN_PROG);
+                        if (record_put and lane_id == 0) {
+                            const long long total_cycles = clock64() - put_start;
+                            const auto sample = atomicAdd(
+                                reinterpret_cast<unsigned long long*>(dispatch_put_cost_stats),
+                                1ull);
+                            // Layout: [count, ring_backpressure,
+                            //          total_0, ticket_0, write_0, publication_0, ...]
+                            const auto sample_base = 2ull + sample * 4ull;
+                            if (sample_base + 3 < static_cast<unsigned long long>(
+                                                      dispatch_put_cost_stats_capacity)) {
+                                dispatch_put_cost_stats[sample_base] = total_cycles;
+                                dispatch_put_cost_stats[sample_base + 1] =
+                                    put_stats.ticket_claim_cycles;
+                                dispatch_put_cost_stats[sample_base + 2] =
+                                    put_stats.submission_write_cycles;
+                                dispatch_put_cost_stats[sample_base + 3] =
+                                    put_stats.publication_cycles;
+                            }
+                            if (put_stats.ring_backpressure &&
+                                dispatch_put_cost_stats_capacity > 1) {
+                                atomicAdd(
+                                    reinterpret_cast<unsigned long long*>(
+                                        dispatch_put_cost_stats) + 1,
+                                    1ull);
+                            }
+                        }
                     } else {
                         // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
@@ -400,6 +431,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int* mask_buffer_ptr,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
+              int64_t* dispatch_put_cost_stats, int dispatch_put_cost_stats_capacity,
               void* rdma_recv_x, uint64_t* rdma_recv_count, void* rdma_x,
               const void* x, const topk_idx_t* topk_idx,
               uint64_t* next_clean, int num_next_clean_int,
@@ -442,6 +474,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               mask_buffer_ptr, \
               cumulative_local_expert_recv_stats, \
               dispatch_wait_recv_cost_stats, \
+              dispatch_put_cost_stats, dispatch_put_cost_stats_capacity, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \

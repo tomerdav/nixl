@@ -61,7 +61,8 @@ put(const nixlMemViewElem &src,
     size_t size,
     unsigned channel_id = 0,
     uint64_t flags = 0,
-    nixlGpuXferStatusH *xfer_status = nullptr) {
+    nixlGpuXferStatusH *xfer_status = nullptr,
+    nixlGpuPutStats *stats = nullptr) {
 
     uint32_t lane_id;
     nixlProxyExecInit<level>(lane_id);
@@ -82,7 +83,8 @@ put(const nixlMemViewElem &src,
                                     .dst_index = static_cast<uint32_t>(dst.index),
                                     .src_proxy_memview_id = proxyMemViewIdFromHandle(src.mvh),
                                     .dst_proxy_memview_id = proxyMemViewIdFromHandle(dst.mvh)},
-                xfer_status);
+                xfer_status,
+                stats);
         }
     }
     nixlProxySync<level>();

@@ -50,8 +50,9 @@ put(const nixlMemViewElem &src,
     size_t size,
     unsigned channel_id = 0,
     uint64_t flags = 0,
-    nixlGpuXferStatusH *xfer_status = nullptr) {
-    return selected_impl::put<level>(src, dst, size, channel_id, flags, xfer_status);
+    nixlGpuXferStatusH *xfer_status = nullptr,
+    nixlGpuPutStats *stats = nullptr) {
+    return selected_impl::put<level>(src, dst, size, channel_id, flags, xfer_status, stats);
 }
 
 template<nixl_gpu_level_t level = nixl_gpu_level_t::THREAD>

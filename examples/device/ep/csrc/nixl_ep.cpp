@@ -1194,6 +1194,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Te
 Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                              const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                              const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
+                             const std::optional<torch::Tensor>& dispatch_put_cost_stats,
                              int num_max_dispatch_tokens_per_rank,
                              bool use_fp8, bool round_scale, bool use_ue8m0,
                              bool async, bool return_recv_hook) {
@@ -1216,6 +1217,11 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->scalar_type() == torch::kInt64);
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->dim() == 1 and dispatch_wait_recv_cost_stats->is_contiguous());
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == active_rank_bound);
+    }
+    if (dispatch_put_cost_stats.has_value()) {
+        EP_HOST_ASSERT(dispatch_put_cost_stats->scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(dispatch_put_cost_stats->dim() == 1 and dispatch_put_cost_stats->is_contiguous());
+        EP_HOST_ASSERT(dispatch_put_cost_stats->size(0) >= 2);
     }
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
@@ -1272,6 +1278,8 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                                mask_buffer_ptr,
                                cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
                                dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                               dispatch_put_cost_stats.has_value() ? dispatch_put_cost_stats->data_ptr<int64_t>() : nullptr,
+                               dispatch_put_cost_stats.has_value() ? static_cast<int>(dispatch_put_cost_stats->size(0)) : 0,
                                buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
                                buffer.dispatch_rdma_send_buffer,
                               x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),

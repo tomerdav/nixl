@@ -29,6 +29,7 @@ from functools import partial
 from typing import cast
 
 import nixl_ep
+import numpy as np
 import rank_server
 import store_group
 import torch
@@ -122,6 +123,7 @@ def test_main(
     seed: int = 0,
     kineto: bool = False,
     fault_tolerance_test: bool = False,
+    dispatch_only: bool = False,
 ):
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
@@ -343,6 +345,8 @@ def test_main(
 
                         # Check combine correctness
                         for zero_copy in (False,) if use_logfmt else (False, True):
+                            if dispatch_only:
+                                break
                             if zero_copy:
                                 buffer.get_next_combine_buffer(handle)[
                                     :, :, :
@@ -405,6 +409,12 @@ def test_main(
         mat_0 @ mat_1
         hook()
 
+    # Sized for bench() default warmups (50) + tests (50). Each sample stores
+    # total, ticket claim, submission write, and publication GPU cycles.
+    put_stats = torch.zeros(
+        2 + num_tokens * num_topk * 100 * 4, dtype=torch.int64, device="cuda"
+    )
+
     # noinspection PyShadowingNames
     def test_func(return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = buffer.dispatch(
@@ -413,11 +423,14 @@ def test_main(
             num_tokens,
             num_experts,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+            dispatch_put_cost_stats=put_stats,
             use_fp8=True,
             async_finish=False,
             return_recv_hook=return_recv_hook,
         )
         return_recv_hook and large_gemm_with_hook(hook)
+        if dispatch_only:
+            return
         combined_x, event, hook = buffer.combine(
             simulated_gemm_x,
             topk_idx,
@@ -442,13 +455,48 @@ def test_main(
             num_logfmt10_bytes if use_logfmt else num_bf16_bytes
         ) * num_selections
 
-    # Dispatch + combine testing
+    # Dispatch (+ combine) testing
     avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
-    print(
-        f"[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, "
-        f"avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us",
-        flush=True,
-    )
+    if dispatch_only:
+        print(
+            f"[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / avg_t:.2f} GB/s, "
+            f"avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us",
+            flush=True,
+        )
+    else:
+        print(
+            f"[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, "
+            f"avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us",
+            flush=True,
+        )
+
+    n_puts = min(int(put_stats[0].item()), (put_stats.numel() - 2) // 4)
+    if n_puts == 0:
+        print(f"[rank {rank}] nixlPut issue: no RDMA puts recorded", flush=True)
+    else:
+        ring_backpressure = int(put_stats[1].item())
+        samples_us = (
+            put_stats[2 : 2 + n_puts * 4]
+            .view(n_puts, 4)
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+            / 1980.0
+        )
+        total_us = samples_us[:, 0]
+        publication_us = samples_us[:, 3]
+        print(
+            f"[rank {rank}] nixlPut issue: n={n_puts} bp={ring_backpressure} "
+            f"avg={np.mean(total_us):.3f} us "
+            f"p50={np.percentile(total_us, 50):.3f} us "
+            f"p99={np.percentile(total_us, 99):.3f} us "
+            f"ticket_avg={np.mean(samples_us[:, 1]):.3f} us "
+            f"write_avg={np.mean(samples_us[:, 2]):.3f} us "
+            f"publication_avg={np.mean(publication_us):.3f} us "
+            f"publication_p50={np.percentile(publication_us, 50):.3f} us "
+            f"publication_p99={np.percentile(publication_us, 99):.3f} us",
+            flush=True,
+        )
 
     # Separate profiling
     if not kineto:
@@ -456,6 +504,26 @@ def test_main(
 
     for return_recv_hook in (False, True):
         buffer.barrier()
+        if dispatch_only:
+            dispatch_t = bench_kineto(
+                partial(test_func, return_recv_hook=return_recv_hook),
+                kernel_names="dispatch",
+                barrier_comm_profiling=True,
+                suppress_kineto_output=False,
+                num_kernels_per_period=2 if return_recv_hook else 1,
+                barrier_fn=test_barrier,
+            )
+            if not return_recv_hook:
+                print(
+                    f"[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[rank {rank}] Dispatch send/recv time: {dispatch_t[0] * 1e6:.2f} + {dispatch_t[1] * 1e6:.2f} us",
+                    flush=True,
+                )
+            continue
         dispatch_t, combine_t = bench_kineto(
             partial(test_func, return_recv_hook=return_recv_hook),
             kernel_names=("dispatch", "combine"),
@@ -634,6 +702,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
             buffer,
             kineto=args.kineto,
             fault_tolerance_test=kill_rank,
+            dispatch_only=args.dispatch_only,
         )
         # Query mask buffer to detect rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
@@ -703,6 +772,11 @@ def main():
         help="TCP server address (for both TCPStore and rank server). If not set, both will be started locally.",
     )
     parser.add_argument("--kineto", action="store_true", help="Enable kineto profiling")
+    parser.add_argument(
+        "--dispatch-only",
+        action="store_true",
+        help="Run dispatch validation and benchmarking without combine",
+    )
     parser.add_argument(
         "--disable-ll-nvlink",
         action="store_true",
