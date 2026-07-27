@@ -24,16 +24,21 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <cuda_runtime.h>
 #include <memory>
 #include <optional>
 #include <pybind11/functional.h>
+#include <string>
+#include <string_view>
 #include <torch/python.h>
+#include <vector>
 
 #include "nixl_ep.hpp"
 #include "kernels/api.cuh"
@@ -81,6 +86,98 @@ uint32_t parse_positive_env(const char *name, uint32_t default_value) {
     }
     return value;
 }
+
+#ifdef NIXL_GPU_DEVICE_BACKEND_PROXY
+std::string_view trim(std::string_view value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
+std::vector<std::string_view> split_comma_list(std::string_view value) {
+    std::vector<std::string_view> result;
+    while (true) {
+        const size_t comma = value.find(',');
+        result.push_back(trim(value.substr(0, comma)));
+        if (comma == std::string_view::npos) {
+            return result;
+        }
+        value.remove_prefix(comma + 1);
+    }
+}
+
+unsigned parse_unsigned(std::string_view value, const char *variable) {
+    value = trim(value);
+    if (value.empty()) {
+        throw std::runtime_error(std::string(variable) + " contains an empty GPU ordinal");
+    }
+
+    unsigned ordinal = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), ordinal);
+    if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        throw std::runtime_error(std::string(variable) + " contains invalid GPU ordinal '" +
+                                 std::string(value) + "'");
+    }
+    return ordinal;
+}
+
+unsigned get_proxy_physical_gpu_ordinal(int logical_device) {
+    const char *visible_devices_env = std::getenv("CUDA_VISIBLE_DEVICES");
+    if (visible_devices_env == nullptr || visible_devices_env[0] == '\0') {
+        return static_cast<unsigned>(logical_device);
+    }
+
+    const auto visible_devices = split_comma_list(visible_devices_env);
+    if (logical_device < 0 || static_cast<size_t>(logical_device) >= visible_devices.size()) {
+        throw std::runtime_error("logical CUDA device " + std::to_string(logical_device) +
+                                 " is outside CUDA_VISIBLE_DEVICES='" +
+                                 std::string(visible_devices_env) + "'");
+    }
+
+    return parse_unsigned(visible_devices[logical_device], "CUDA_VISIBLE_DEVICES");
+}
+
+std::string get_proxy_nic_for_gpu(unsigned physical_gpu) {
+    const char *nic_map_env = std::getenv("NIXL_GPU_NIC_MAP");
+    if (nic_map_env == nullptr || nic_map_env[0] == '\0') {
+        throw std::runtime_error(
+            "NIXL_GPU_NIC_MAP is required for the proxy backend; set a comma-separated "
+            "physical-GPU-indexed NIC list such as 'mlx5_0,mlx5_1,...'");
+    }
+
+    const auto nic_map = split_comma_list(nic_map_env);
+    if (physical_gpu >= nic_map.size()) {
+        throw std::runtime_error("physical GPU " + std::to_string(physical_gpu) +
+                                 " has no entry in NIXL_GPU_NIC_MAP='" +
+                                 std::string(nic_map_env) + "'");
+    }
+
+    const std::string_view nic = nic_map[physical_gpu];
+    if (nic.empty()) {
+        throw std::runtime_error("physical GPU " + std::to_string(physical_gpu) +
+                                 " maps to an empty NIC in NIXL_GPU_NIC_MAP");
+    }
+    if (nic.find(':') != std::string_view::npos) {
+        throw std::runtime_error("NIXL_GPU_NIC_MAP entries must be base NIC names without a port; "
+                                 "use '" + std::string(nic.substr(0, nic.find(':'))) +
+                                 "' instead of '" + std::string(nic) + "'");
+    }
+
+    return std::string(nic);
+}
+
+void append_engine_config(nixl_b_params_t &init_params, std::string_view config) {
+    std::string &engine_config = init_params["engine_config"];
+    if (!engine_config.empty()) {
+        engine_config += ',';
+    }
+    engine_config += config;
+}
+#endif
 
 } // namespace
 
@@ -1489,6 +1586,17 @@ void Buffer::_nixl_agent_init() {
 
 #ifdef NIXL_GPU_DEVICE_BACKEND_PROXY
     init_params["ucx_num_device_channels"] = "1";
+
+    int logical_device;
+    CUDA_CHECK(cudaGetDevice(&logical_device));
+    const unsigned physical_gpu = get_proxy_physical_gpu_ordinal(logical_device);
+    const std::string selected_nic = get_proxy_nic_for_gpu(physical_gpu);
+    init_params["device_list"] = selected_nic;
+    append_engine_config(init_params, "TLS=rc_mlx5,MAX_RMA_RAILS=1");
+    printf("NIXL EP proxy affinity: logical_gpu=%d physical_gpu=%u nic=%s "
+           "UCX_TLS=rc_mlx5 UCX_MAX_RMA_RAILS=1\n",
+           logical_device, physical_gpu, selected_nic.c_str());
+
     // One UCX worker (EP/QP) per (channel, peer): the proxy adapter routes a submission to
     // worker (channel_id * peer_capacity + peer_index), giving each peer of a channel an
     // isolated QP and progress context. peer_capacity == max_num_ranks, so the local-rank
