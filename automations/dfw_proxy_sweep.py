@@ -33,7 +33,18 @@ PLAN_PATH = EP_DIR / "tests" / "elastic" / "no_expansion.json"
 
 CUDA_VISIBLE_DEVICES = "0,1,4,5"
 GPU_NIC_MAP = "mlx5_0,mlx5_1,mlx5_2,mlx5_4,mlx5_5,mlx5_6"
-PYTHONPATH = "/workspace/external/nixl/install/lib/python3/dist-packages"
+PYTHONPATH = os.pathsep.join(
+    (
+        str(REPO_ROOT / "src" / "bindings" / "python" / "nixl-meta"),
+        str(REPO_ROOT / "build-proxy-release" / "examples" / "device" / "ep"),
+        str(EP_DIR),
+        str(EP_DIR / "tests"),
+        str(EP_DIR / "tests" / "elastic"),
+    )
+)
+NIXL_PLUGIN_DIR = str(
+    REPO_ROOT / "build-proxy-release" / "src" / "plugins" / "ucx"
+)
 EXPECTED_RANKS = frozenset(range(4))
 DEFAULT_TIMEOUT_SECONDS = 40.0
 TERMINATION_GRACE_SECONDS = 1.0
@@ -43,7 +54,13 @@ SWEEP_ENVIRONMENT_VARIABLES = (
     "NIXL_EP_PROXY_CHANNELS",
     "NIXL_EP_PROXY_WORKER_COUNT",
     "NIXL_EP_NUM_CHANNELS",
+    "NIXL_LOG_LEVEL",
+    "NIXL_PLUGIN_DIR",
+    "PYTHONDONTWRITEBYTECODE",
     "PYTHONPATH",
+    "UCX_MAX_RMA_RAILS",
+    "UCX_NET_DEVICES",
+    "UCX_TLS",
 )
 EXPECTED_NIXL_EP_BACKENDS = {
     "proxy": "proxy",
@@ -61,7 +78,7 @@ NIXLPUT_ISSUE_RE = re.compile(
     r"n=(?P<n>\d+)(?: bp=(?P<bp>\d+))? "
     r"avg=(?P<avg>\d+(?:\.\d+)?) us "
     r"p50=(?P<p50>\d+(?:\.\d+)?) us "
-    r"p99=(?P<p99>\d+(?:\.\d+)?) us$"
+    r"p99=(?P<p99>\d+(?:\.\d+)?) us(?: .*)?$"
 )
 
 
@@ -183,6 +200,7 @@ def build_parameter_points(
             for channels, proxy_workers, experts in product(
                 channel_counts, proxy_worker_counts, experts_per_rank
             )
+            if proxy_workers <= channels
         ]
 
     if backend == "direct":
@@ -202,7 +220,7 @@ def build_parameter_points(
 
 def build_command(experts_per_rank: int) -> list[str]:
     return [
-        "python3",
+        sys.executable,
         str(ELASTIC_SCRIPT),
         "--plan",
         str(PLAN_PATH),
@@ -215,6 +233,7 @@ def build_command(experts_per_rank: int) -> list[str]:
         "--num-topk",
         "8",
         "--dispatch-only",
+        "--kineto",
         "--disable-ll-nvlink",
     ]
 
@@ -228,6 +247,12 @@ def build_environment(
 
     environment["PYTHONPATH"] = PYTHONPATH
     environment["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
+    environment["NIXL_LOG_LEVEL"] = "WARN"
+    environment["NIXL_PLUGIN_DIR"] = NIXL_PLUGIN_DIR
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["UCX_MAX_RMA_RAILS"] = "1"
+    environment["UCX_NET_DEVICES"] = "all"
+    environment["UCX_TLS"] = "^cuda_ipc"
     if backend == "proxy":
         if proxy_workers is None:
             raise ValueError("proxy backend requires a proxy worker count")
@@ -249,14 +274,35 @@ def build_environment(
 
 def verify_nixl_ep_backend(backend: str, environment: dict[str, str]) -> str:
     expected_backend = EXPECTED_NIXL_EP_BACKENDS[backend]
-    probe_prefix = "NIXL_EP_BACKEND="
+    build_options_path = (
+        REPO_ROOT
+        / "build-proxy-release"
+        / "meson-info"
+        / "intro-buildoptions.json"
+    )
+    try:
+        build_options = json.loads(build_options_path.read_text(encoding="utf-8"))
+        loaded_backend = next(
+            option["value"]
+            for option in build_options
+            if option["name"] == "gpu_device_api_backend"
+        )
+    except (OSError, json.JSONDecodeError, KeyError, StopIteration) as error:
+        raise RuntimeError(
+            f"could not inspect configured EP backend in {build_options_path}: "
+            f"{error}"
+        ) from error
+
+    if loaded_backend != expected_backend:
+        raise RuntimeError(
+            f"--backend {backend} requires nixl_ep backend '{expected_backend}', "
+            f"but build-proxy-release is configured for '{loaded_backend}'"
+        )
+
     probe_command = [
-        "python3",
+        sys.executable,
         "-c",
-        (
-            "import nixl_ep; "
-            f"print('{probe_prefix}' + nixl_ep.get_gpu_device_api_backend())"
-        ),
+        "import nixl_ep",
     ]
 
     try:
@@ -279,22 +325,6 @@ def verify_nixl_ep_backend(backend: str, environment: dict[str, str]) -> str:
             f"{details}"
         )
 
-    backend_lines = [
-        line.removeprefix(probe_prefix)
-        for line in probe.stdout.splitlines()
-        if line.startswith(probe_prefix)
-    ]
-    if len(backend_lines) != 1:
-        raise RuntimeError(
-            "nixl_ep backend probe did not return exactly one backend value"
-        )
-
-    loaded_backend = backend_lines[0]
-    if loaded_backend != expected_backend:
-        raise RuntimeError(
-            f"--backend {backend} requires nixl_ep backend '{expected_backend}', "
-            f"but the installed extension reports '{loaded_backend}'"
-        )
     return loaded_backend
 
 
@@ -1178,10 +1208,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             plot_path,
         )
     except RuntimeError as error:
-        print(f"error: {error}", file=sys.stderr)
-        print(f"Per-run summary: {summary_path}", flush=True)
-        print(f"Aggregate summary: {aggregate_summary_path}", flush=True)
-        return 2
+        print(f"warning: {error}", file=sys.stderr)
+        plot_paths = []
 
     print(f"Per-run summary: {summary_path}", flush=True)
     print(f"Aggregate summary: {aggregate_summary_path}", flush=True)
