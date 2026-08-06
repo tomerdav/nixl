@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <cuda_runtime.h>
 #include <memory>
@@ -1393,13 +1394,8 @@ void Buffer::_nixl_agent_init() {
     std::string agent_name = std::to_string(rank);
     nixlAgentConfig cfg;
 
-    // Match agent-side selection: compile-time default, overridable by NIXL_DEVICE_PROXY.
-    bool enable_device_proxy =
-#ifdef NIXL_GPU_DEVICE_BACKEND_PROXY
-        true;
-#else
-        false;
-#endif
+    // The generic Device API defaults to direct UCX, with an exact runtime override.
+    bool enable_device_proxy = false;
     if (const char *proxy_override = std::getenv("NIXL_DEVICE_PROXY")) {
         if (std::strcmp(proxy_override, "0") == 0) {
             enable_device_proxy = false;
