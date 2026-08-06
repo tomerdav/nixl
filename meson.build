@@ -439,51 +439,14 @@ if ucx_dep.found()
     endif
 endif
 
-gpu_device_api_backend_requested = get_option('gpu_device_api_backend')
-gpu_device_api_backend_resolved = gpu_device_api_backend_requested
-
-if gpu_device_api_backend_requested == 'auto'
-    if ucx_gpu_device_api_available
-        gpu_device_api_backend_resolved = 'ucx'
-    else
-        gpu_device_api_backend_resolved = 'none'
-    endif
-elif gpu_device_api_backend_requested == 'ucx'
-    if not ucx_gpu_device_api_available
-        error('gpu_device_api_backend=ucx requires UCX GPU Device API support')
-    endif
-elif gpu_device_api_backend_requested == 'proxy'
-    if not cuda_dep.found()
-        error('gpu_device_api_backend=proxy requires CUDA')
-    endif
-endif
-
-gpu_device_api_define = ''
-gpu_device_api_supported = gpu_device_api_backend_resolved != 'none'
-gpu_device_api_is_ucx = gpu_device_api_backend_resolved == 'ucx'
-gpu_device_api_is_proxy = gpu_device_api_backend_resolved == 'proxy'
-gpu_device_api_cpp_args = []
-gpu_device_api_cuda_args = []
+gpu_device_api_supported = cuda_dep.found()
 gpu_device_api_deps = []
-gpu_device_api_link_with = []
-
-if gpu_device_api_is_ucx
-    gpu_device_api_define = '-DNIXL_GPU_DEVICE_BACKEND_UCX'
-    gpu_device_api_deps = [ucx_dep, doca_gpunetio_dep]
-elif gpu_device_api_is_proxy
-    gpu_device_api_define = '-DNIXL_GPU_DEVICE_BACKEND_PROXY'
+if cuda_dep.found()
     gpu_device_api_deps = [cuda_dep]
 endif
-
-if gpu_device_api_define != ''
-    gpu_device_api_cpp_args += [gpu_device_api_define]
-    gpu_device_api_cuda_args += [gpu_device_api_define]
+if ucx_gpu_device_api_available
+    gpu_device_api_deps += [ucx_dep, doca_gpunetio_dep]
 endif
-
-summary({
-    'Requested backend' : gpu_device_api_backend_requested,
-    'Resolved backend'  : gpu_device_api_backend_resolved,
-}, section: 'GPU Device API')
 
 summary({
     'UCX backend available'   : ucx_gpu_device_api_available,
@@ -586,8 +549,6 @@ endif
 
 nixl_inc_dirs = include_directories('src/api/cpp', 'src/api/cpp/backend', 'src/infra', 'src/core', 'src/core/telemetry')
 nixl_gpu_device_api_inc_dirs = include_directories('src/api/gpu', 'src/api')
-nixl_gpu_inc_dirs = include_directories('src/api/gpu/ucx')
-nixl_gpu_proxy_inc_dirs = include_directories('src/api/gpu/proxy')
 plugins_inc_dirs = include_directories('src/plugins')
 utils_inc_dirs = include_directories('src/utils')
 
@@ -631,12 +592,10 @@ if get_option('install_headers')
       install_dir: prefix_inc + '/gpu/proxy')
     install_headers('src/core/device_proxy/proxy_protocol.h',
                     install_dir: prefix_inc + '/device_proxy')
-  endif
-  if ucx_gpu_device_api_available
-    install_headers(
-      'src/api/gpu/ucx/nixl_device.cuh',
-      'src/api/gpu/ucx/nixl_device_impl.cuh',
-      install_dir: prefix_inc + '/gpu/ucx')
+    if ucx_gpu_device_api_available
+      install_headers('src/api/gpu/ucx/nixl_device_impl.cuh',
+                      install_dir: prefix_inc + '/gpu/ucx')
+    endif
   endif
 endif
 
