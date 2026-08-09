@@ -36,6 +36,11 @@
 #include <asio.hpp>
 
 namespace {
+nixl_status_t
+worker_fence(ucp_worker_h worker) {
+    return nixl::ucx::ucsToNixlStatus(ucp_worker_fence(worker));
+}
+
 [[nodiscard]] uint32_t
 epCloseFlags(const nixl_b_params_t *custom_params) {
     return nixl::getBackendParamDefaulted(custom_params, "ucx_ep_close_force", false) ?
