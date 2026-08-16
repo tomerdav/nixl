@@ -1172,6 +1172,12 @@ nixlUcxEngine::submitProxyAtomicAdd(const nixlMetaDesc &remote,
         return NIXL_ERR_INVALID_PARAM;
     }
 
+    // Ensure prior puts issued by this worker are visible before the signal atomic.
+    const auto status = worker_fence(getSharedWorker(worker_id)->get());
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
     auto &ep = rmd->conn->getEp(worker_id);
     return ep->atomicAdd(value, static_cast<uint64_t>(remote.addr), rmd->getRkey(worker_id), req);
 }
