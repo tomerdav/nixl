@@ -1443,6 +1443,7 @@ void Buffer::_nixl_agent_init() {
         init_params["num_workers"] =
             std::to_string(proxy_channels * static_cast<uint32_t>(max_num_ranks));
         init_params["ucx_error_handling_mode"] = "none";
+        init_params["engine_config"] = "FENCE_MODE=ep_based";
     } else {
         const char* num_channels_env = std::getenv("NIXL_EP_NUM_CHANNELS");
         init_params["ucx_num_device_channels"] = num_channels_env ? num_channels_env : "4";
