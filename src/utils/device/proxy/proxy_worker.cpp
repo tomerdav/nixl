@@ -20,6 +20,15 @@
 #include "nixl_log.h"
 #include <chrono>
 
+namespace {
+/**
+ * How long a single drain waits for the backend to finish what a ring already
+ * submitted. A healthy ring drains in microseconds; this only has to be short
+ * enough that one wedged peer cannot stall a membership change.
+ */
+constexpr std::chrono::milliseconds kProxyDrainTimeout{100};
+} // namespace
+
 ProxyWorker::ProxyWorker(const nixlProxyBackendOps *backend_ops,
                          const nixlProxyMemViewRegistry *proxy_memview_registry,
                          std::atomic<uint64_t> *shutdown_state,
@@ -28,7 +37,8 @@ ProxyWorker::ProxyWorker(const nixlProxyBackendOps *backend_ops,
                          uint32_t channel_count,
                          uint32_t worker_index,
                          uint32_t worker_count,
-                         uint64_t pthr_delay_us) noexcept
+                         uint64_t pthr_delay_us,
+                         const std::atomic<uint64_t> *drain_requested) noexcept
     : backend_ops_(backend_ops),
       proxy_memview_registry_(proxy_memview_registry),
       shutdown_state_(shutdown_state),
@@ -37,7 +47,8 @@ ProxyWorker::ProxyWorker(const nixlProxyBackendOps *backend_ops,
       channel_count_(channel_count),
       worker_index_(worker_index),
       worker_count_(worker_count),
-      pthr_delay_us_(pthr_delay_us) {}
+      pthr_delay_us_(pthr_delay_us),
+      drain_requested_(drain_requested) {}
 
 ProxyWorker::~ProxyWorker() {
     join();
@@ -97,9 +108,67 @@ ProxyWorker::submitOwnedChannels() {
 
 void
 ProxyWorker::runOnce() {
+    // Checked first so a drain observes the rings before this pass adds to
+    // them. A relaxed load against a word that only changes at a membership
+    // transition costs nothing on the steady-state path.
+    if (drain_requested_ != nullptr) {
+        const uint64_t requested = drain_requested_->load(std::memory_order_acquire);
+        if (requested != drain_acked_.load(std::memory_order_relaxed)) {
+            drainOwnedChannels();
+            drain_acked_.store(requested, std::memory_order_release);
+        }
+    }
+
     submitOwnedChannels();
     driveBackendProgress();
     publishOwnedChannels();
+}
+
+bool
+ProxyWorker::ownedChannelsDrained() {
+    bool all_drained = true;
+    forEachOwnedChannel([&](nixlProxyChannelState &channel, uint32_t, uint32_t) {
+        all_drained = all_drained && channel.drained();
+    });
+    return all_drained;
+}
+
+void
+ProxyWorker::drainOwnedChannels() {
+    // Nothing more than the ordinary pass, repeated until there is nothing
+    // left. Stepping every ring each time is what keeps a peer whose requests
+    // never terminate from starving the rings behind it, and one deadline for
+    // the whole sweep bounds a drain to a single timeout however many rings
+    // this worker owns. The GPU is quiesced by the caller, so submit_idx_ only
+    // moves as this worker picks up records that were already published.
+    const auto deadline = std::chrono::steady_clock::now() + kProxyDrainTimeout;
+    while (!ownedChannelsDrained()) {
+        submitOwnedChannels();
+        driveBackendProgress();
+        publishOwnedChannels();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+    }
+
+    forEachOwnedChannel([this](nixlProxyChannelState &channel, uint32_t channel_id, uint32_t peer) {
+        if (!channel.allocated()) {
+            return;
+        }
+        if (!channel.drained()) {
+            // A dead peer under err_mode=none may never complete. Give the
+            // requests back and say so, instead of dropping the work silently
+            // the way a retire used to.
+            const size_t released = channel.releaseInflightRequests(*backend_ops_);
+            NIXL_WARN << "ProxyWorker::drainOwnedChannels: channel " << channel_id << " peer "
+                      << peer << " did not drain (timed out); released " << released
+                      << " in-flight request(s)";
+        }
+        if (channel.rearm() != NIXL_SUCCESS) {
+            NIXL_ERROR << "ProxyWorker::drainOwnedChannels: failed to rearm channel " << channel_id
+                       << " peer " << peer;
+        }
+    });
 }
 
 void
