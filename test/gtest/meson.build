@@ -121,8 +121,12 @@ gtest_sources = [
 
 if ucx_gpu_device_api_available
     gtest_sources += device_api_test_sources
-    device_api_inc = [nixl_device_inc_dirs, include_directories('device_api')]
+    device_api_inc = [nixl_device_inc_dirs, utils_inc_dirs, include_directories('device_api')]
     device_api_dep = [ucx_dep, doca_gpunetio_dep]
+    # The proxy tests drive the runtime and the memview wrapper directly.
+    if is_variable('device_proxy_interface')
+        device_api_dep += [device_proxy_interface]
+    endif
 else
     device_api_inc = []
     device_api_dep = []
