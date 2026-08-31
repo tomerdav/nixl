@@ -353,8 +353,40 @@ makeDirectWorker(const nixlProxyBackendOps *ops,
                  const nixlProxyMemViewRegistry *registry,
                  std::atomic<uint64_t> *shutdown_state,
                  nixlProxyChannelState *channel) {
+    // No drain request source: these tests drive runOnce() by hand.
     return std::make_unique<ProxyWorker>(
-        ops, registry, shutdown_state, channel, 1, 1, 0, 1, 0);
+        ops, registry, shutdown_state, channel, 1, 1, 0, 1, 0, nullptr);
+}
+
+// Two rings of one channel, sharing a control buffer, wired the way the runtime
+// wires them: slot = channel_id * max_peers + peer.
+static nixl_status_t
+allocateTwoPeerChannels(nixlProxyChannelState *channels,
+                        nixlProxyControlBuffer &control_slots,
+                        uint32_t depth) {
+    nixlDeviceAllocator &allocator = nixlGetDeviceAllocator();
+    nixl_status_t status = control_slots.allocate(allocator, kProxyCiSlotBase + 2);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    for (size_t peer = 0; peer < 2; ++peer) {
+        status = channels[peer].allocate(
+            allocator, depth, &control_slots, kProxyCiSlotBase + peer);
+        if (status != NIXL_SUCCESS) {
+            return status;
+        }
+    }
+    return NIXL_SUCCESS;
+}
+
+static std::unique_ptr<ProxyWorker>
+makeTwoPeerWorker(const nixlProxyBackendOps *ops,
+                  const nixlProxyMemViewRegistry *registry,
+                  std::atomic<uint64_t> *shutdown_state,
+                  nixlProxyChannelState *channels,
+                  const std::atomic<uint64_t> *drain_requested) {
+    return std::make_unique<ProxyWorker>(
+        ops, registry, shutdown_state, channels, 2, 1, 0, 1, 0, drain_requested);
 }
 
 static nixl_remote_meta_dlist_t
@@ -1164,6 +1196,74 @@ TEST_F(ProxyRuntimeTest, ShutdownReleasesAllPendingBackendRequests) {
     ASSERT_EQ(backend_state->released_requests.size(), 2u);
     EXPECT_EQ(backend_state->released_requests[0].token, 1u);
     EXPECT_EQ(backend_state->released_requests[1].token, 2u);
+}
+
+// A drain gives every ring a chance to make progress. A peer whose requests
+// never complete burns the whole deadline, so if the rings were drained one
+// after another the peers behind it would be cancelled without ever being
+// stepped - re-creating, at a membership change, exactly the loss of healthy
+// peers' work that draining exists to prevent (repo docs/issues/005 G1).
+TEST_F(ProxyRuntimeTest, DrainDoesNotStarveRingsBehindAWedgedOne) {
+    DummyBackendMD remote_md;
+    StubBackend backend;
+    backend.submit_rc_ = NIXL_IN_PROG;
+    // Nothing completes by default; peer 1's requests are allowed through
+    // below. Peer 0 is drained first and stays wedged for the full deadline.
+    backend.completion_rc_ = NIXL_IN_PROG;
+
+    nixlProxyMemViewRegistry registry(nixlGetDeviceAllocator(), nullptr);
+    nixlMemViewH dst_proxy = nullptr;
+    ASSERT_EQ(registry.prepRemote(makeRemotePeerDlist({"wedged", "healthy"}, &remote_md),
+                                  {},
+                                  dst_proxy),
+              NIXL_SUCCESS);
+
+    constexpr uint32_t kDepth = 4;
+    nixlProxyChannelState channels[2];
+    nixlProxyControlBuffer control_slots;
+    ASSERT_EQ(allocateTwoPeerChannels(channels, control_slots, kDepth), NIXL_SUCCESS);
+
+    std::atomic<uint64_t> shutdown_state{
+        static_cast<uint64_t>(nixl_proxy_control_state_t::RUNNING)};
+    std::atomic<uint64_t> drain_requested{0};
+    const nixlProxyBackendOps ops = backend.ops();
+    auto worker =
+        makeTwoPeerWorker(&ops, &registry, &shutdown_state, channels, &drain_requested);
+
+    // Peer 0 gets one record, which will be submitted as token 1 and never
+    // complete. Peer 1 gets a full ring, which needs one submitReady each.
+    nixlProxySubmission wedged = makeAtomicAddSubmission(dst_proxy);
+    wedged.dst_index = 0;
+    publishRecord(channels[0].recordsHost(), 0, wedged, 1);
+
+    nixlProxySubmission healthy = makeAtomicAddSubmission(dst_proxy);
+    healthy.dst_index = 1;
+    for (uint32_t slot = 0; slot < kDepth; ++slot) {
+        publishRecord(channels[1].recordsHost(), slot, healthy, 100 + slot);
+    }
+    // Token 1 is peer 0's; everything after it belongs to peer 1.
+    for (uint64_t token = 2; token <= kDepth + 1; ++token) {
+        backend.setCompletionStatus(token, NIXL_SUCCESS);
+    }
+
+    drain_requested.store(1, std::memory_order_release);
+    worker->runOnce();
+
+    std::vector<nixlBackendProxySubmission> submissions;
+    {
+        std::lock_guard<std::mutex> lock(backend.submit_mutex_);
+        submissions = backend.submissions_;
+    }
+    size_t healthy_submissions = 0;
+    for (const auto &submission : submissions) {
+        healthy_submissions += submission.peer_index == 1 ? 1 : 0;
+    }
+    EXPECT_EQ(healthy_submissions, size_t{kDepth});
+
+    // The wedged peer is the only one that loses anything.
+    std::lock_guard<std::mutex> lock(backend.state_->released_mutex);
+    ASSERT_EQ(backend.state_->released_requests.size(), 1u);
+    EXPECT_EQ(backend.state_->released_requests.front().token, 1u);
 }
 
 } // namespace proxy_runtime

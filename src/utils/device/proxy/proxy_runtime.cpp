@@ -135,6 +135,21 @@ nixlProxyChannelState::releaseInflightRequests(const nixlProxyBackendOps &backen
     return released;
 }
 
+bool
+nixlProxyChannelState::drained() const noexcept {
+    if (ring_depth_ == 0) {
+        return true;
+    }
+    if (consumer_idx_shadow_ != submit_idx_) {
+        return false;
+    }
+    // Catching up to submit_idx_ is not enough: records the GPU published but
+    // no worker has picked up yet sit past it. Same readiness test
+    // ProxyWorker::submitReady() uses.
+    const uint32_t slot = static_cast<uint32_t>(submit_idx_ % ring_depth_);
+    return __atomic_load_n(&recordsHost()[slot].op_idx, __ATOMIC_ACQUIRE) == 0;
+}
+
 nixl_status_t
 nixlProxyChannelState::publishConsumerIdx(uint64_t value) noexcept {
     if (control_slots_ == nullptr) {
@@ -279,7 +294,8 @@ nixlProxyRuntime::build() {
                                                          channel_count,
                                                          worker_idx,
                                                          worker_count,
-                                                         config_.pthr_delay_us));
+                                                         config_.pthr_delay_us,
+                                                         &drain_requested_));
     }
 
     NIXL_INFO << "ProxyRuntime::build: complete - " << max_peers << " peers, " << channel_count
@@ -292,7 +308,6 @@ nixl_status_t
 nixlProxyRuntime::loadRemoteConnInfo(const std::string &remote_name, const nixl_blob_t &conn_info) {
     NIXL_INFO << "ProxyRuntime::loadRemoteConnInfo: remote='" << remote_name
               << "' conn_info_size=" << conn_info.size();
-
     if (!backend_ops_.on_remote_loaded) {
         return NIXL_SUCCESS;
     }
@@ -341,7 +356,38 @@ nixlProxyRuntime::unregisterProxyMemView(nixlMemViewH proxy_memview) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
+    // Records already in the rings still name this memview. Retiring it under
+    // them is how queued transfers - including ones to healthy peers - used to
+    // disappear at a membership change (repo docs/issues/005, G1).
+    drainChannels();
     return memview_registry_->unregister(proxy_memview);
+}
+
+void
+nixlProxyRuntime::drainChannels() noexcept {
+    if (!workers_started_) {
+        // Nobody is progressing the rings, so there is nothing to wait for and
+        // nobody to race: do the whole thing here.
+        for (auto &channel : channels_) {
+            static_cast<void>(channel.releaseInflightRequests(backend_ops_));
+            if (channel.allocated() && channel.rearm() != NIXL_SUCCESS) {
+                NIXL_ERROR << "ProxyRuntime::drainChannels: failed to rearm a channel";
+            }
+        }
+        return;
+    }
+
+    const uint64_t requested = drain_requested_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    for (const auto &worker : workers_) {
+        while (worker->drainAcked() < requested) {
+            if (shutdown_state_.load(std::memory_order_acquire) !=
+                static_cast<uint64_t>(nixl_proxy_control_state_t::RUNNING)) {
+                NIXL_WARN << "ProxyRuntime::drainChannels: shutting down mid-drain";
+                return;
+            }
+            std::this_thread::yield();
+        }
+    }
 }
 
 bool
