@@ -67,6 +67,8 @@ struct alignas(64) nixlProxyChannelState {
     /** Device-resident cache of consumer_idx_dev_ used by GPU enqueue backpressure. */
     nixlDeviceMem consumer_idx_cache_mem_;
     nixlProxyControlBuffer *control_slots_ = nullptr;
+    /** Shared with every ring of the same peer; owned by the runtime. */
+    const std::atomic<bool> *peer_failed_ = nullptr;
     /** Remembered from allocate() so rearm() needs no arguments. */
     nixlDeviceAllocator *allocator_ = nullptr;
     size_t control_slot_index_ = 0;
@@ -86,7 +88,18 @@ struct alignas(64) nixlProxyChannelState {
     allocate(nixlDeviceAllocator &allocator,
              uint32_t depth,
              nixlProxyControlBuffer *control_slots,
-             size_t control_slot_index);
+             size_t control_slot_index,
+             const std::atomic<bool> *peer_failed = nullptr);
+
+    /**
+     * The backend has reported the peer behind this ring gone. Waiting for it
+     * to drain cannot succeed before the transport times out, which is orders
+     * of magnitude past any drain deadline.
+     */
+    [[nodiscard]] bool
+    peerFailed() const noexcept {
+        return peer_failed_ != nullptr && peer_failed_->load(std::memory_order_acquire);
+    }
 
     /**
      * Put an allocated ring back to the state allocate() left it in - empty,
@@ -169,6 +182,14 @@ class nixlProxyRuntime {
         nixl_status_t
         remoteDisconnected(const std::string &remote_name);
 
+        /**
+         * The backend lost its endpoints to this agent. Rings serving it stop
+         * being waited on; their in-flight work is released at the next drain.
+         * Safe to call from a backend progress thread.
+         */
+        void
+        remoteFailed(const std::string &remote_agent) noexcept;
+
         [[nodiscard]] nixl_status_t
         prepMemView(const nixl_meta_dlist_t &dlist,
                     nixlMemViewH *proxy_memview);
@@ -212,6 +233,19 @@ class nixlProxyRuntime {
         void
         drainChannels() noexcept;
 
+        /**
+         * Remember which agent each ring peer serves. Peer index is the
+         * descriptor ordinal of a remote memview - the invariant the whole
+         * ring topology rests on - so this is the only place that mapping
+         * exists.
+         */
+        void
+        recordPeerAgents(const nixl_remote_meta_dlist_t &dlist) noexcept;
+
+        /** Returns how many peers the agent occupies. */
+        size_t
+        setPeerFailed(const std::string &remote_agent, bool failed) noexcept;
+
         nixlProxyRuntime(nixlProxyBackendOps backend_ops,
                          const nixlProxyConfig &config,
                          nixlDeviceAllocator &allocator) noexcept;
@@ -239,6 +273,11 @@ class nixlProxyRuntime {
             static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN)};
         /** Bumped once per drain; each worker acks it when it has applied it. */
         alignas(64) std::atomic<uint64_t> drain_requested_{0};
+        /** One flag per ring peer, read by the workers, written on failures. */
+        std::vector<std::atomic<bool>> peer_failed_;
+        mutable std::mutex peers_mutex_;
+        /** Ring peer index -> remote agent; empty string means unknown. */
+        std::vector<std::string> peer_agents_;
         uint64_t *shutdown_word_dev_ = nullptr;
         bool workers_started_ = false;
 };

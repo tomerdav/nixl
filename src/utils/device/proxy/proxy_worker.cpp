@@ -128,7 +128,11 @@ bool
 ProxyWorker::ownedChannelsDrained() {
     bool all_drained = true;
     forEachOwnedChannel([&](nixlProxyChannelState &channel, uint32_t, uint32_t) {
-        all_drained = all_drained && channel.drained();
+        // A ring whose peer the backend has given up on will never drain
+        // before the transport timeout, which is far past any deadline worth
+        // holding a membership change for. Stop waiting on it immediately; the
+        // pass below releases what it was holding.
+        all_drained = all_drained && (channel.drained() || channel.peerFailed());
     });
     return all_drained;
 }
@@ -161,8 +165,9 @@ ProxyWorker::drainOwnedChannels() {
             // the way a retire used to.
             const size_t released = channel.releaseInflightRequests(*backend_ops_);
             NIXL_WARN << "ProxyWorker::drainOwnedChannels: channel " << channel_id << " peer "
-                      << peer << " did not drain (timed out); released " << released
-                      << " in-flight request(s)";
+                      << peer << " did not drain ("
+                      << (channel.peerFailed() ? "peer reported dead" : "timed out")
+                      << "); released " << released << " in-flight request(s)";
         }
         if (channel.rearm() != NIXL_SUCCESS) {
             NIXL_ERROR << "ProxyWorker::drainOwnedChannels: failed to rearm channel " << channel_id

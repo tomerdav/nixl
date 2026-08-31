@@ -794,5 +794,73 @@ namespace proxy_host {
         EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
     }
 
+    // Under err-mode none the transport takes ~15 s to give up on a dead peer,
+    // so waiting out a drain deadline for one is pure delay. The backend's
+    // failure notification short-circuits it.
+    TEST_F(ProxyHostTest, DrainDoesNotWaitForAFailedPeer) {
+        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
+        nixlMemViewH src = nullptr, dst = nullptr;
+        prepMemViews(src, dst, "doomed");
+        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
+
+        const ChannelAccess access = channel();
+        publish(access, 0, makePut(src, dst), 1);
+        ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 1; }));
+
+        runtime_->remoteFailed("doomed");
+
+        const auto start = std::chrono::steady_clock::now();
+        ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        EXPECT_LT(elapsed, std::chrono::milliseconds(50));
+        EXPECT_EQ(backend_.released(), (std::vector<uint64_t>{backend_.token(0)}));
+        EXPECT_EQ(consumerIdx(access), 0u);
+
+        EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
+    }
+
+    TEST_F(ProxyHostTest, FailingAnUnknownAgentChangesNothing) {
+        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
+        nixlMemViewH src = nullptr, dst = nullptr;
+        prepMemViews(src, dst, "doomed");
+        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
+
+        const ChannelAccess access = channel();
+        publish(access, 0, makePut(src, dst), 1);
+        ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 1; }));
+
+        runtime_->remoteFailed("someone-else");
+
+        // Still a live peer as far as the proxy knows, so the drain waits.
+        const auto start = std::chrono::steady_clock::now();
+        ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
+        EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(50));
+
+        EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
+    }
+
+    // A peer that comes back is not dead any more.
+    TEST_F(ProxyHostTest, ReconnectingAPeerClearsItsFailure) {
+        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
+        nixlMemViewH src = nullptr, dst = nullptr;
+        prepMemViews(src, dst, "flaky");
+        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
+
+        runtime_->remoteFailed("flaky");
+        ASSERT_EQ(runtime_->loadRemoteConnInfo("flaky", nixl_blob_t("addr")), NIXL_SUCCESS);
+
+        const ChannelAccess access = channel();
+        publish(access, 0, makePut(src, dst), 1);
+        ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 1; }));
+
+        // Cleared, so this drain waits out the deadline like any live peer.
+        const auto start = std::chrono::steady_clock::now();
+        ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
+        EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(50));
+
+        EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
+    }
+
 } // namespace proxy_host
 } // namespace gtest
