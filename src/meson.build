@@ -19,6 +19,9 @@ subdir('utils')
 
 #subdir('arch')
 subdir('infra')
+# Entered here rather than from src/utils because it links nixl_infra, which
+# subdir('infra') above has only just declared.
+subdir('utils/device/proxy')
 subdir('plugins')
 subdir('core')
 
