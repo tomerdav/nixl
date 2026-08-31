@@ -54,6 +54,9 @@ if is_variable('device_proxy_interface')
 
     subdir('proxy_runtime')
     unit_test_deps += [proxy_runtime_unit_test_dep]
+
+    subdir('proxy_host')
+    unit_test_deps += [proxy_host_unit_test_dep]
 endif
 
 cpp = meson.get_compiler('cpp')
