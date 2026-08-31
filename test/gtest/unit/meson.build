@@ -18,6 +18,10 @@ unit_test_deps = [
     gtest_dep,
 ]
 
+if is_variable('device_proxy_interface')
+    unit_test_deps += [device_proxy_interface]
+endif
+
 if is_variable('obj_backend_interface')
     subdir('obj')
     unit_test_deps += [obj_unit_test_dep]
@@ -28,9 +32,6 @@ unit_test_deps += [agent_unit_test_dep]
 
 subdir('descriptors')
 unit_test_deps += [descriptors_unit_test_dep]
-
-subdir('device_allocator')
-unit_test_deps += [device_allocator_unit_test_dep]
 
 subdir('util')
 unit_test_deps += [util_unit_test_dep]
