@@ -18,6 +18,7 @@
 #define NIXL_SRC_UTILS_UCX_UCX_UTILS_H
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <type_traits>
 
@@ -48,6 +49,8 @@ private:
     std::atomic<nixl::ucx::ep_state_t> state_{nixl::ucx::ep_state_t::UNINITIALIZED};
     /** Remembered because it decides which close flavours UCP will accept. */
     const ucp_err_handling_mode_t errHandlingMode_;
+    /** Invoked once, from UCX progress, when the endpoint first fails. */
+    const std::function<void()> onFailed_;
 
     /**
      * UCP only accepts UCP_EP_CLOSE_FLAG_FORCE, and only guarantees request
@@ -81,7 +84,10 @@ public:
         return nixl::ucx::toNixlStatus(state_);
     }
 
-    nixlUcxEp(ucp_worker_h worker, void *addr, ucp_err_handling_mode_t err_handling_mode);
+    nixlUcxEp(ucp_worker_h worker,
+              void *addr,
+              ucp_err_handling_mode_t err_handling_mode,
+              std::function<void()> on_failed = nullptr);
     ~nixlUcxEp();
     nixlUcxEp(const nixlUcxEp &) = delete;
     nixlUcxEp &
@@ -237,7 +243,7 @@ public:
     [[nodiscard]] std::string
     epAddr();
     [[nodiscard]] std::unique_ptr<nixlUcxEp>
-    connect(void *addr);
+    connect(void *addr, std::function<void()> on_failed = nullptr);
 
     /* Active message handling */
     int
