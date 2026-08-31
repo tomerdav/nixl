@@ -25,6 +25,7 @@ endif
 
 device_proxy_lib = library('nixl_device_proxy',
            ['proxy_config.cpp', 'proxy_config.h',
+            'proxy_runtime.cpp', 'proxy_runtime.h',
             'proxy_registry.cpp', 'proxy_registry.h', 'proxy_registry_entry.h',
             'proxy_submission.cpp', 'proxy_submission.h',
             'proxy_ring.cpp', 'proxy_ring.h',
