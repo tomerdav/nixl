@@ -37,6 +37,34 @@ TEST(ProxyBackendParamsTest, CreateAndTeardown) {
     // Teardown (agent destructor) must join the proxy threads cleanly.
 }
 
+// Real callers seed their parameters from getPluginParams() rather than
+// building the map by hand, and that seeds the plugin's own default of
+// num_workers=1. In proxy mode the engine derives the worker count from
+// channels x peers, so an inherited 1 is an explicit value that disagrees -
+// and the caller has to erase it, not merely refrain from setting it.
+TEST(ProxyBackendParamsTest, PluginDefaultNumWorkersMustBeErasedForProxy) {
+    nixlAgentConfig cfg(false);
+    nixlAgent agent("proxy_params_plugin_defaults", std::move(cfg));
+
+    nixl_mem_list_t mems;
+    nixl_b_params_t params;
+    ASSERT_EQ(agent.getPluginParams("UCX", mems, params), NIXL_SUCCESS);
+    ASSERT_EQ(params.count("num_workers"), 1u) << "plugin no longer seeds num_workers; "
+                                                  "the erase below may be unnecessary";
+
+    params["device_proxy"] = "true";
+    params["proxy_channel_count"] = "2";
+    params["proxy_max_peers"] = "4";
+
+    // Left in place, the inherited default conflicts with 2 x 4 = 8.
+    nixlBackendH *rejected = nullptr;
+    EXPECT_NE(agent.createBackend("UCX", params, rejected), NIXL_SUCCESS);
+
+    params.erase("num_workers");
+    nixlBackendH *backend = nullptr;
+    EXPECT_EQ(agent.createBackend("UCX", params, backend), NIXL_SUCCESS);
+}
+
 TEST(ProxyBackendParamsTest, MatchingNumWorkersAccepted) {
     nixlAgentConfig cfg(false);
     nixlAgent agent("proxy_params_match", std::move(cfg));
