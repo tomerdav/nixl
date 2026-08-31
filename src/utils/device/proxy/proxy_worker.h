@@ -37,7 +37,8 @@ class ProxyWorker {
                     uint32_t channel_count,
                     uint32_t worker_index,
                     uint32_t worker_count,
-                    uint64_t pthr_delay_us) noexcept;
+                    uint64_t pthr_delay_us,
+                    const std::atomic<uint64_t> *drain_requested) noexcept;
         ~ProxyWorker();
 
         void
@@ -47,6 +48,12 @@ class ProxyWorker {
 
         void
         runOnce();
+
+        /** The drain generation this worker has fully applied. */
+        [[nodiscard]] uint64_t
+        drainAcked() const noexcept {
+            return drain_acked_.load(std::memory_order_acquire);
+        }
 
     private:
         nixlProxyChannelState *
@@ -60,6 +67,17 @@ class ProxyWorker {
         template<typename Fn>
         void
         forEachOwnedChannel(Fn &&fn);
+
+        [[nodiscard]] bool
+        ownedChannelsDrained();
+
+        /**
+         * Drive every owned ring to a terminal state and rearm it. Runs on the
+         * worker thread because the worker is the only writer of the ring
+         * state involved, so no application thread ever touches it.
+         */
+        void
+        drainOwnedChannels();
 
         void
         publishOwnedChannels();
@@ -91,6 +109,9 @@ class ProxyWorker {
         uint32_t worker_index_ = 0;
         uint32_t worker_count_ = 0;
         uint64_t pthr_delay_us_ = 0;
+        /** Owned by the runtime; bumped by an application thread per drain. */
+        const std::atomic<uint64_t> *drain_requested_ = nullptr;
+        alignas(64) std::atomic<uint64_t> drain_acked_{0};
         std::thread thread_;
 };
 

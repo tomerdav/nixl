@@ -462,19 +462,25 @@ namespace proxy_runtime {
         backend_.complete(backend_.token(0));
         ASSERT_TRUE(waitFor([&]() { return consumerIdx(access) == 1u; }));
 
-        // Retiring frees the device view at once - only the GPU reads it, and
-        // the caller has quiesced the GPU, the same contract as the direct
-        // path's ucp_device_mem_list_release - and forgets the handle.
+        // Retiring drains the rings first, then frees the device view at once -
+        // only the GPU reads it, and the caller has quiesced the GPU, the same
+        // contract as the direct path's ucp_device_mem_list_release - and
+        // forgets the handle.
         ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
         EXPECT_TRUE(allocator_.wasFreed(dst));
         nixlMemViewH resolved = nullptr;
         EXPECT_FALSE(runtime_->resolveProxyMemView(dst, resolved));
         EXPECT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_ERR_INVALID_PARAM);
 
+        // The drain rearmed the ring, so the next generation starts over.
+        EXPECT_EQ(consumerIdx(access), 0u);
+        EXPECT_EQ(completedIdx(access), 0u);
+        EXPECT_EQ(access.completion->completion_status, NIXL_IN_PROG);
+
         // The worker survives it: a record naming the retired id is rejected
         // rather than dispatched, and the other view still resolves.
-        publish(access, 1, record, 2);
-        ASSERT_TRUE(waitFor([&]() { return consumerIdx(access) == 2u; }));
+        publish(access, 0, record, 2);
+        ASSERT_TRUE(waitFor([&]() { return consumerIdx(access) == 1u; }));
         EXPECT_EQ(backend_.submissionCount(), 1u);
         EXPECT_EQ(completedIdx(access), 2u);
         EXPECT_LT(access.completion->completion_status, 0);
@@ -558,6 +564,50 @@ namespace proxy_runtime {
         EXPECT_EQ(consumerIdx(middle), 1u);
         EXPECT_EQ(consumerIdx(idle), 0u);
         EXPECT_EQ(completedIdx(idle), 0u);
+    }
+
+    // A drain steps every ring on each sweep. A peer whose requests never
+    // complete burns the whole deadline; if rings were drained one after
+    // another, the peers behind it would be cancelled without ever being
+    // stepped - the same loss of healthy peers' work that draining exists to
+    // prevent (repo docs/issues/005 G1).
+    TEST_F(ProxyRuntimeTest, DrainDoesNotStarveRingsBehindAWedgedOne) {
+        ASSERT_EQ(createRuntime(/*channel_count=*/1, /*max_peers=*/2), NIXL_SUCCESS);
+        nixlMemViewH src = nullptr, dst = nullptr;
+        prepMemViews(src, dst, {"wedged", "healthy"});
+        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
+
+        // Peer 0 is drained first and never completes, so it burns the deadline.
+        const ChannelAccess wedged = channel(0, 0);
+        publish(wedged, 0, makePut(src, dst, /*channel_id=*/0, /*dst_index=*/0), 1);
+
+        // Fill the healthy peer's ring so the worker cannot pick anything else
+        // up until something completes - that is what makes this deterministic.
+        const ChannelAccess healthy = channel(0, 1);
+        const nixlProxySubmission healthy_record =
+            makePut(src, dst, /*channel_id=*/0, /*dst_index=*/1);
+        for (uint64_t i = 0; i < kRingDepth; ++i) {
+            publish(healthy, i, healthy_record, 100 + i);
+        }
+        ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == kRingDepth + 1; }));
+        uint64_t wedged_token = 0;
+        const auto submitted = backend_.submissions();
+        for (size_t i = 0; i < submitted.size(); ++i) {
+            if (submitted[i].peer_index == 0) {
+                wedged_token = backend_.token(i);
+            }
+        }
+        ASSERT_NE(wedged_token, 0u);
+
+        // One more behind the full ring, which only a drain can get to.
+        publish(healthy, kRingDepth, healthy_record, 200);
+        backend_.completePeer(1);
+
+        ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
+
+        // Every healthy record made it out; only the wedged peer lost anything.
+        EXPECT_EQ(backend_.submissionCount(), size_t{kRingDepth} + 2);
+        EXPECT_EQ(backend_.released(), std::vector<uint64_t>{wedged_token});
     }
 
     TEST_F(ProxyRuntimeTest, ShutdownAfterCompletionReleasesNothingAndFreesEverything) {
