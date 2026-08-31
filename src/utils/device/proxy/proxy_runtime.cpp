@@ -29,7 +29,8 @@ nixl_status_t
 nixlProxyChannelState::allocate(nixlDeviceAllocator &allocator,
                                 uint32_t depth,
                                 nixlProxyControlBuffer *control_slots,
-                                size_t control_slot_index) {
+                                size_t control_slot_index,
+                                const std::atomic<bool> *peer_failed) {
     NIXL_INFO << "nixlProxyChannelState::allocate: depth=" << depth
               << " control_slot_index=" << control_slot_index;
     if (depth == 0 || control_slots == nullptr ||
@@ -39,6 +40,7 @@ nixlProxyChannelState::allocate(nixlDeviceAllocator &allocator,
 
     ring_depth_ = depth;
     control_slots_ = control_slots;
+    peer_failed_ = peer_failed;
     allocator_ = &allocator;
     control_slot_index_ = control_slot_index;
     consumer_idx_dev_ = control_slots_->devicePtr(control_slot_index_);
@@ -171,6 +173,7 @@ nixlProxyChannelState::deallocate() noexcept {
     work_ring_mem_.reset();
     consumer_idx_dev_ = nullptr;
     control_slots_ = nullptr;
+    peer_failed_ = nullptr;
     allocator_ = nullptr;
     control_slot_index_ = 0;
     consumer_idx_shadow_ = 0;
@@ -243,6 +246,10 @@ nixlProxyRuntime::build() {
         return rc;
     }
     shutdown_word_dev_ = control_slots_.devicePtr(kProxyShutdownSlot);
+    // Sized once here; the channels below hold pointers into it, so it must
+    // not be resized afterwards.
+    peer_failed_ = std::vector<std::atomic<bool>>(max_peers);
+    peer_agents_.assign(max_peers, std::string());
     channels_.resize(channel_slots);
     device_channel_views_.resize(channel_slots);
     for (uint32_t channel_idx = 0; channel_idx < channel_count; channel_idx++) {
@@ -251,7 +258,8 @@ nixlProxyRuntime::build() {
             rc = channels_[slot].allocate(allocator_,
                                           config_.ring_depth,
                                           &control_slots_,
-                                          kProxyCiSlotBase + slot);
+                                          kProxyCiSlotBase + slot,
+                                          &peer_failed_[peer_idx]);
             if (rc != NIXL_SUCCESS) {
                 return rc;
             }
@@ -308,6 +316,10 @@ nixl_status_t
 nixlProxyRuntime::loadRemoteConnInfo(const std::string &remote_name, const nixl_blob_t &conn_info) {
     NIXL_INFO << "ProxyRuntime::loadRemoteConnInfo: remote='" << remote_name
               << "' conn_info_size=" << conn_info.size();
+    // Connecting again means the agent is back; stop treating its rings as
+    // hopeless.
+    static_cast<void>(setPeerFailed(remote_name, false));
+
     if (!backend_ops_.on_remote_loaded) {
         return NIXL_SUCCESS;
     }
@@ -339,6 +351,8 @@ nixlProxyRuntime::prepMemView(const nixl_remote_meta_dlist_t &dlist, nixlMemView
         return NIXL_ERR_INVALID_PARAM;
     }
 
+    recordPeerAgents(dlist);
+
     std::vector<void *> direct_ptrs;
     if (backend_ops_.resolve_direct_ptrs) {
         const nixl_status_t resolve_status = backend_ops_.resolve_direct_ptrs(dlist, direct_ptrs);
@@ -361,6 +375,55 @@ nixlProxyRuntime::unregisterProxyMemView(nixlMemViewH proxy_memview) {
     // disappear at a membership change (repo docs/issues/005, G1).
     drainChannels();
     return memview_registry_->unregister(proxy_memview);
+}
+
+void
+nixlProxyRuntime::recordPeerAgents(const nixl_remote_meta_dlist_t &dlist) noexcept {
+    const std::lock_guard<std::mutex> lock(peers_mutex_);
+
+    size_t peer = 0;
+    for (const auto &desc : dlist) {
+        if (peer >= peer_agents_.size()) {
+            NIXL_ERROR << "ProxyRuntime: remote memview has " << dlist.descCount()
+                       << " descriptors but the proxy has only " << peer_agents_.size()
+                       << " peer slots; descriptors past the end cannot be addressed";
+            break;
+        }
+        if (desc.remoteAgent != nixl_null_agent) {
+            peer_agents_[peer] = desc.remoteAgent;
+        }
+        ++peer;
+    }
+}
+
+size_t
+nixlProxyRuntime::setPeerFailed(const std::string &remote_agent, bool failed) noexcept {
+    const std::lock_guard<std::mutex> lock(peers_mutex_);
+
+    size_t matched = 0;
+    for (size_t peer = 0; peer < peer_agents_.size(); ++peer) {
+        if (peer_agents_[peer] != remote_agent) {
+            continue;
+        }
+        peer_failed_[peer].store(failed, std::memory_order_release);
+        ++matched;
+    }
+    return matched;
+}
+
+void
+nixlProxyRuntime::remoteFailed(const std::string &remote_agent) noexcept {
+    // Called from a backend progress thread, so it touches nothing a worker
+    // owns: the flags are atomics and the agent table has its own small lock,
+    // never the registry's.
+    if (setPeerFailed(remote_agent, true) == 0) {
+        NIXL_DEBUG << "ProxyRuntime::remoteFailed: '" << remote_agent
+                   << "' holds no ring peer slot; nothing to do";
+        return;
+    }
+    NIXL_WARN << "ProxyRuntime::remoteFailed: backend lost its endpoints to '" << remote_agent
+              << "'; its rings will not be waited on and their in-flight work is released at "
+                 "the next drain";
 }
 
 void
@@ -480,6 +543,13 @@ nixlProxyRuntime::shutdown() {
     shutdown_word_dev_ = nullptr;
     device_channel_views_mem_.reset();
     device_channel_views_.clear();
+
+    {
+        // A late failure notification must not match anything once the rings
+        // it would touch are gone.
+        const std::lock_guard<std::mutex> lock(peers_mutex_);
+        peer_agents_.clear();
+    }
     channels_.clear();
     control_slots_.deallocate();
     // Drop the callbacks last: they are what makes a second shutdown a no-op,
