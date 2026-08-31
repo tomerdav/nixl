@@ -93,6 +93,9 @@ private:
     const std::vector<nixl::ucx::rkey> rkeys_;
 };
 
+class nixlProxyRuntime;
+struct nixlProxyConfig;
+
 class nixlUcxEngine : public nixlBackendEngine {
 public:
     static std::unique_ptr<nixlUcxEngine>
@@ -238,6 +241,18 @@ private:
     releaseProxyRequest(size_t worker_id, nixlUcxReq req) const;
 
 #ifdef HAVE_NIXL_DEVICE_API
+    /**
+     * Create and start the engine-owned proxy runtime. Called as the last
+     * step of create(); worker threads call back into the engine, so it must
+     * be fully constructed first.
+     */
+    [[nodiscard]] nixl_status_t
+    setupProxyRuntime(const nixlProxyConfig &config);
+
+    /** Wrap a backend memview into the device-dispatch handle; cleans up on failure. */
+    [[nodiscard]] nixl_status_t
+    wrapMemView(nixlMemViewH backend_mvh, nixlMemViewH &mvh) const;
+
     /** Shared by the local and remote prepMemView overloads; kind names which. */
     template<typename DlistT>
     nixl_status_t
@@ -348,6 +363,11 @@ private:
 
     // Map of agent name to saved nixlUcxConnection info
     std::unordered_map<std::string, ucx_connection_ptr_t> remoteConnMap;
+
+#ifdef HAVE_NIXL_DEVICE_API
+    /* Engine-owned device proxy (enabled via the device_proxy backend param). */
+    std::unique_ptr<nixlProxyRuntime> proxyRuntime_;
+#endif
 };
 
 class nixlUcxThread;
