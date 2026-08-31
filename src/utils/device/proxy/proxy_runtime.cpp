@@ -343,6 +343,12 @@ proxyRuntime::unregisterProxyMemView(nixlMemViewH proxy_memview) {
     return memview_registry_->unregister(proxy_memview);
 }
 
+nixl_status_t
+proxyRuntime::discardUnpublishedMemView(nixlMemViewH proxy_memview) {
+    const std::lock_guard lock(control_mutex_);
+    return memview_registry_->unregister(proxy_memview);
+}
+
 void
 proxyRuntime::drainChannels() noexcept {
     if (!workers_started_) {
