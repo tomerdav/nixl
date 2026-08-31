@@ -184,6 +184,10 @@ public:
     unsigned
     progress();
 
+    /** Progress a single shared worker; the proxy drives one per ring. */
+    unsigned
+    progress(size_t worker_id);
+
     void
     progressLoop();
 
