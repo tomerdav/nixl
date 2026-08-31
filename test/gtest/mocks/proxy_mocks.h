@@ -229,6 +229,197 @@ namespace proxy_mocks {
         return desc;
     }
 
+    /**
+     * Mock transport behind nixlProxyBackendOps. Records every submission and
+     * completes a request only when the test says so, which puts the moment a
+     * worker observes a terminal status under the test's control.
+     */
+    class MockBackend {
+    public:
+        nixlProxyBackendOps
+        ops() {
+            nixlProxyBackendOps ops;
+            ops.init = [this](const nixlProxyConfig &config) {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                init_thread_count_ = config.effectiveThreadCount();
+                return init_status_;
+            };
+            ops.submit = [this](const nixlBackendProxySubmission &submission,
+                                nixlBackendProxyRequest &request) {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                submissions_.push_back(submission);
+                const uint64_t token = ++next_token_;
+                tokens_.push_back(token);
+                token_peer_[token] = submission.peer_index;
+                nixl_status_t status = NIXL_IN_PROG;
+                if (!submit_statuses_.empty()) {
+                    status = submit_statuses_.front();
+                    submit_statuses_.erase(submit_statuses_.begin());
+                }
+                request = status == NIXL_IN_PROG ?
+                    nixlBackendProxyRequest{token, submission.channel_id} :
+                    nixlBackendProxyRequest{};
+                return status;
+            };
+            ops.check_completion = [this](const nixlBackendProxyRequest &request) {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                if (complete_on_check_) {
+                    return NIXL_SUCCESS;
+                }
+                const auto peer = token_peer_.find(request.token);
+                if (peer != token_peer_.end() && healthy_peers_.count(peer->second) != 0) {
+                    return NIXL_SUCCESS;
+                }
+                const auto it = completed_.find(request.token);
+                return it == completed_.end() ? NIXL_IN_PROG : it->second;
+            };
+            ops.release_request = [this](const nixlBackendProxyRequest &request) {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                released_.push_back(request.token);
+            };
+            ops.progress = [](uint32_t, uint32_t) { return NIXL_SUCCESS; };
+            ops.shutdown = [this]() {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                ++shutdown_calls_;
+                return NIXL_SUCCESS;
+            };
+            if (resolver_enabled_) {
+                ops.resolve_direct_ptrs = [this](const nixl_remote_meta_dlist_t &dlist,
+                                                 std::vector<void *> &direct_ptrs) {
+                    const std::lock_guard<std::mutex> lock(mutex_);
+                    ++resolve_calls_;
+                    last_resolved_desc_count_ = static_cast<size_t>(dlist.descCount());
+                    if (resolver_status_ == NIXL_SUCCESS) {
+                        direct_ptrs = direct_ptrs_;
+                    }
+                    return resolver_status_;
+                };
+            }
+            return ops;
+        }
+
+        /** What init() returns; the runtime must fail to build on an error. */
+        void
+        failInit(nixl_status_t status) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            init_status_ = status;
+        }
+
+        /** Finish one request; the worker sees the status on its next check. */
+        void
+        complete(uint64_t token, nixl_status_t status = NIXL_SUCCESS) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            completed_[token] = status;
+        }
+
+        /** Every request finishes as soon as it is checked. */
+        void
+        completeEverything() {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            complete_on_check_ = true;
+        }
+
+        /** Requests bound for this peer finish as soon as they are checked. */
+        void
+        completePeer(uint32_t peer_index) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            healthy_peers_.insert(peer_index);
+        }
+
+        /** The next submit() returns this status instead of accepting the request. */
+        void
+        failNextSubmit(nixl_status_t status) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            submit_statuses_.push_back(status);
+        }
+
+        void
+        setDirectPointers(std::vector<void *> direct_ptrs) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            direct_ptrs_ = std::move(direct_ptrs);
+        }
+
+        void
+        setResolverStatus(nixl_status_t status) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            resolver_status_ = status;
+        }
+
+        /** Leave resolve_direct_ptrs unset in the next ops(). */
+        void
+        disableResolver() {
+            resolver_enabled_ = false;
+        }
+
+        size_t
+        submissionCount() const {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return submissions_.size();
+        }
+
+        std::vector<nixlBackendProxySubmission>
+        submissions() const {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return submissions_;
+        }
+
+        /** Backend token of the n-th submission, in submission order. */
+        uint64_t
+        token(size_t index) const {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return index < tokens_.size() ? tokens_[index] : 0;
+        }
+
+        std::vector<uint64_t>
+        released() const {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return released_;
+        }
+
+        uint32_t
+        initThreadCount() const {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return init_thread_count_;
+        }
+
+        size_t
+        shutdownCalls() const {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return shutdown_calls_;
+        }
+
+        size_t
+        resolveCalls() const {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return resolve_calls_;
+        }
+
+        size_t
+        lastResolvedDescCount() const {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return last_resolved_desc_count_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        std::vector<nixlBackendProxySubmission> submissions_;
+        std::vector<uint64_t> tokens_;
+        std::vector<uint64_t> released_;
+        std::vector<nixl_status_t> submit_statuses_;
+        std::map<uint64_t, nixl_status_t> completed_;
+        std::map<uint64_t, uint32_t> token_peer_;
+        std::set<uint32_t> healthy_peers_;
+        std::vector<void *> direct_ptrs_;
+        nixl_status_t init_status_ = NIXL_SUCCESS;
+        nixl_status_t resolver_status_ = NIXL_SUCCESS;
+        bool complete_on_check_ = false;
+        bool resolver_enabled_ = true;
+        uint64_t next_token_ = 0;
+        uint32_t init_thread_count_ = 0;
+        size_t shutdown_calls_ = 0;
+        size_t resolve_calls_ = 0;
+        size_t last_resolved_desc_count_ = 0;
+    };
 
 } // namespace proxy_mocks
 } // namespace gtest
