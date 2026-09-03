@@ -447,6 +447,36 @@ namespace agent {
         local_agent_->releaseMemView(mvh);
     }
 
+    /* The remote agent name is the only thing in a remote memory view that
+       identifies which peer a descriptor belongs to, so a backend that maps
+       descriptors to peers depends on it surviving the section lookup. */
+    TEST_F(dualAgentBridgeFixture, PrepMemViewRemoteCarriesRemoteAgent) {
+        DualAgentSetup s(DRAM_SEG);
+        setupDualAgent(s, /*register_local=*/false);
+
+        nixl_remote_dlist_t remote_dlist(DRAM_SEG);
+        remote_dlist.addDesc(nixlRemoteDesc(s.remote_blob.getDesc(), s.remote_agent_name));
+
+        static int dummy_mvh;
+        EXPECT_CALL(local_agent_helper_->getGMockEngine(),
+                    prepMemView(testing::_, testing::_, testing::_))
+            .WillOnce([&](const nixl_remote_meta_dlist_t &dlist,
+                          nixlMemViewH &out_mvh,
+                          const nixl_opt_b_args_t *) {
+                EXPECT_EQ(dlist.descCount(), 1);
+                for (const auto &desc : dlist) {
+                    EXPECT_EQ(desc.remoteAgent, s.remote_agent_name);
+                }
+                out_mvh = &dummy_mvh;
+                return NIXL_SUCCESS;
+            });
+
+        nixlMemViewH mvh = nullptr;
+        EXPECT_EQ(local_agent_->prepMemView(remote_dlist, mvh), NIXL_SUCCESS);
+
+        local_agent_->releaseMemView(mvh);
+    }
+
     TEST_F(dualAgentBridgeFixture, XferReqSubFunctionsTest) {
         const std::string msg = "notification";
         EXPECT_CALL(remote_agent_helper_->getGMockEngine(), getNotifs)

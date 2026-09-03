@@ -124,6 +124,17 @@ struct nixlRemoteMetaDesc : public nixlMetaDesc {
     explicit nixlRemoteMetaDesc(const std::string &remote_agent)
         : nixlMetaDesc(),
           remoteAgent(remote_agent) {}
+
+    // Inheriting nixlMetaDesc's constructors makes it easy to build one of
+    // these from a brace list and silently leave remoteAgent empty; prefer
+    // this overload wherever the remote agent is known.
+    nixlRemoteMetaDesc(uintptr_t addr,
+                       size_t len,
+                       uint64_t dev_id,
+                       nixlBackendMD *metadata,
+                       std::string remote_agent)
+        : nixlMetaDesc(addr, len, dev_id, metadata),
+          remoteAgent(std::move(remote_agent)) {}
 };
 
 inline bool
