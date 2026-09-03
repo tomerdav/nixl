@@ -17,6 +17,7 @@
 device_api_inc_dirs = include_directories('.')
 
 device_api_sources = [
+    'proxy_write_test.cu',
     'single_write_test.cu',
     'utils.cu'
 ]
