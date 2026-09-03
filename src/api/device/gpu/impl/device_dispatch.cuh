@@ -52,10 +52,66 @@ getPtr(nixlMemViewH, size_t) {
 
 namespace nixl::gpu::impl {
 
+namespace detail {
+
+    __device__ __forceinline__ const memViewWrapper *
+    asDeviceMemView(nixlMemViewH handle) {
+        return static_cast<const memViewWrapper *>(handle);
+    }
+
+    template<level_t level>
+    __device__ __forceinline__ bool
+    executionLeader() {
+        if constexpr (level == level_t::THREAD) {
+            return true;
+        } else if constexpr (level == level_t::WARP) {
+            return threadIdx.x % warpSize == 0;
+        } else if constexpr (level == level_t::BLOCK) {
+            return threadIdx.x == 0;
+        } else if constexpr (level == level_t::GRID) {
+            return blockIdx.x == 0 && threadIdx.x == 0;
+        }
+    }
+
+    __device__ __forceinline__ exec_mode_t
+    loadExecutionMode(const xferStatusH &status) {
+        uint32_t execution_mode = 0;
+        memcpy(&execution_mode, status.storage + xfer_status_payload_size, sizeof(execution_mode));
+        return static_cast<exec_mode_t>(execution_mode);
+    }
+
+    /**
+     * Record which implementation owns this status handle, so a later poll
+     * can find its way back to the same one.
+     *
+     * Tagged on any accepted submission, not only on NIXL_IN_PROG: the UCX
+     * arm reports an operation that completed inline as NIXL_SUCCESS, and
+     * such a handle is still a legal argument to getXferStatus. Leaving it
+     * untagged would make that poll read mode zero and fail.
+     */
+    template<level_t level>
+    __device__ __forceinline__ void
+    writeExecutionMode(xferStatusH *status,
+                       nixl_status_t submission_status,
+                       exec_mode_t execution_mode) {
+        if (status == nullptr || submission_status < 0 || !executionLeader<level>()) {
+            return;
+        }
+        const uint32_t mode = static_cast<uint32_t>(execution_mode);
+        memcpy(status->storage + xfer_status_payload_size, &mode, sizeof(mode));
+    }
+
+} // namespace detail
+
 template<level_t level>
 __device__ nixl_status_t
 getXferStatus(xferStatusH &xfer_status) {
-    return ucx::getXferStatus<level>(xfer_status);
+    switch (detail::loadExecutionMode(xfer_status)) {
+    case exec_mode_t::UCX_DIRECT:
+        return ucx::getXferStatus<level>(xfer_status);
+    default:
+        return NIXL_ERR_INVALID_PARAM;
+    }
 }
 
 template<level_t level>
@@ -66,7 +122,20 @@ put(const memViewElem &src,
     unsigned channel_id,
     uint64_t flags,
     xferStatusH *xfer_status) {
-    return ucx::put<level>(src, dst, size, channel_id, flags, xfer_status);
+    const auto *src_view = detail::asDeviceMemView(src.mvh);
+    const auto *dst_view = detail::asDeviceMemView(dst.mvh);
+    const memViewElem backend_src{src_view->backend_memview, src.index, src.offset};
+    const memViewElem backend_dst{dst_view->backend_memview, dst.index, dst.offset};
+
+    // The destination decides: it is the view that names the peer.
+    nixl_status_t status;
+    if (dst_view->execution_mode == exec_mode_t::UCX_DIRECT) {
+        status = ucx::put<level>(backend_src, backend_dst, size, channel_id, flags, xfer_status);
+    } else {
+        status = NIXL_ERR_INVALID_PARAM;
+    }
+    detail::writeExecutionMode<level>(xfer_status, status, dst_view->execution_mode);
+    return status;
 }
 
 template<level_t level>
@@ -76,12 +145,28 @@ atomicAdd(uint64_t value,
           unsigned channel_id,
           uint64_t flags,
           xferStatusH *xfer_status) {
-    return ucx::atomicAdd<level>(value, counter, channel_id, flags, xfer_status);
+    const auto *view = detail::asDeviceMemView(counter.mvh);
+    const memViewElem backend_counter{view->backend_memview, counter.index, counter.offset};
+
+    nixl_status_t status;
+    if (view->execution_mode == exec_mode_t::UCX_DIRECT) {
+        status = ucx::atomicAdd<level>(value, backend_counter, channel_id, flags, xfer_status);
+    } else {
+        status = NIXL_ERR_INVALID_PARAM;
+    }
+    detail::writeExecutionMode<level>(xfer_status, status, view->execution_mode);
+    return status;
 }
 
 __device__ inline void *
 getPtr(nixlMemViewH mvh, size_t index) {
-    return ucx::getPtr(mvh, index);
+    const auto *view = detail::asDeviceMemView(mvh);
+    switch (view->execution_mode) {
+    case exec_mode_t::UCX_DIRECT:
+        return ucx::getPtr(view->backend_memview, index);
+    default:
+        return nullptr;
+    }
 }
 
 } // namespace nixl::gpu::impl
