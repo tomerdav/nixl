@@ -103,6 +103,13 @@ nixlProxyChannelState::rearm() noexcept {
             NIXL_SUCCESS) {
         return NIXL_ERR_BACKEND;
     }
+    // A memset is only enqueued. The producer kernel reads both words, and a
+    // stream created non-blocking - as PyTorch does - is not ordered against
+    // the default stream, so the zeroing must land before the ring is handed
+    // back. Once per reset, off the submission path.
+    if (allocator_->synchronize() != NIXL_SUCCESS) {
+        return NIXL_ERR_BACKEND;
+    }
     if (publishConsumerIdx(0) != NIXL_SUCCESS) {
         return NIXL_ERR_BACKEND;
     }
