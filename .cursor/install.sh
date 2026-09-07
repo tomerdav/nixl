@@ -91,8 +91,12 @@ log "Installing Python build/runtime dependencies"
 PIP="sudo pip3 install --no-cache-dir --break-system-packages"
 $PIP meson ninja pybind11 patchelf tomlkit pyyaml uv numpy
 if [ "${HAVE_CUDA}" = "1" ]; then
-    # Default PyPI Linux wheel is the CUDA build (bundles its own CUDA runtime).
-    $PIP torch
+    # PyTorch's CUDA *major* must match the toolkit that drives NIXL's binding
+    # variant: the CUDA 12.x toolkit builds `nixl_cu12`, and NIXL's meta package
+    # picks the backend from `torch.version.cuda`. The default PyPI wheel tracks
+    # the latest CUDA (currently 13), which would make NIXL look for the
+    # uninstalled `nixl_cu13`, so pin the CUDA 12.x wheel explicitly.
+    $PIP torch --index-url https://download.pytorch.org/whl/cu128
 else
     $PIP torch --index-url https://download.pytorch.org/whl/cpu
 fi
