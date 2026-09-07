@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Cloud Agent install script for NIXL.
 #
-# Builds a CPU-only, source install of NIXL suitable for development in a
-# Cloud Agent VM (no GPU / RDMA hardware): UCX (TCP + shared-memory transports),
-# a modern Abseil, and NIXL itself with the vendor-neutral UCX and POSIX
-# plugins plus the Python bindings.
+# Builds a source install of NIXL for development in a Cloud Agent VM. By default
+# it enables build-time CUDA support (CUDA toolkit + UCX built --with-cuda + the
+# CUDA-dependent GDS plugin) so agents can develop, compile, and link the CUDA
+# code paths. The VM has no NVIDIA GPU, so the CUDA runtime paths (VRAM
+# transfers, torch.cuda kernels) compile but cannot execute here; the CPU/DRAM
+# data path over UCX is fully runnable.
 #
-# Idempotent: system packages, UCX, and Abseil are only (re)built when missing,
-# while NIXL is always rebuilt from the checked-out source.
+# Set NIXL_ENABLE_CUDA=0 for a CPU-only build (no CUDA toolkit, UCX built
+# --without-cuda, no GDS plugin).
+#
+# Idempotent: CUDA toolkit, UCX, and Abseil are only (re)built when missing;
+# NIXL is always rebuilt from the checked-out source.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,6 +20,15 @@ NPROC="$(nproc)"
 UCX_VERSION="v1.23.x"
 ABSL_TAG="lts_2025_08_14"
 PREFIX="/usr/local"
+
+# Build-time CUDA knobs (all overridable from the environment).
+NIXL_ENABLE_CUDA="${NIXL_ENABLE_CUDA:-1}"
+CUDA_APT_VERSION="${CUDA_APT_VERSION:-12-9}"   # apt metapackage suffix, e.g. 12-9
+# CUDA arch(es) to compile device code for. A single arch keeps builds fast; set
+# to your target GPU's SM (e.g. 80=A100, 89=L40S, 90=H100, 100=B200) or a
+# comma-separated list. Only relevant for CUDA builds.
+NIXL_CUDA_ARCH_LIST="${NIXL_CUDA_ARCH_LIST:-90}"
+CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 
 # NIXL uses GCC; the image's default `c++`/`cc` may point at clang, which cannot
 # find libstdc++ here. Pin the compilers explicitly.
@@ -37,7 +51,38 @@ sudo apt-get install -y --no-install-recommends \
     git ca-certificates wget
 
 # ---------------------------------------------------------------------------
-# 2. Python build + runtime dependencies (system interpreter)
+# 2. CUDA toolkit (build-time; skipped when NIXL_ENABLE_CUDA=0)
+# ---------------------------------------------------------------------------
+if [ "${NIXL_ENABLE_CUDA}" = "1" ]; then
+    if [ -x "${CUDA_HOME}/bin/nvcc" ]; then
+        log "CUDA toolkit $("${CUDA_HOME}/bin/nvcc" --version | grep -oP 'release \K[0-9.]+') already installed; skipping"
+    elif [ "$(uname -m)" != "x86_64" ]; then
+        log "CUDA apt repo is only wired up for x86_64 here; disabling CUDA"
+        NIXL_ENABLE_CUDA=0
+    else
+        log "Installing CUDA toolkit ${CUDA_APT_VERSION}"
+        KEYRING_TMP="$(mktemp -d)"
+        wget -q -O "${KEYRING_TMP}/cuda-keyring.deb" \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+        sudo dpkg -i "${KEYRING_TMP}/cuda-keyring.deb"
+        rm -rf "${KEYRING_TMP}"
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends "cuda-toolkit-${CUDA_APT_VERSION}"
+    fi
+fi
+
+# Resolve final CUDA availability and put nvcc on PATH for the meson build.
+if [ "${NIXL_ENABLE_CUDA}" = "1" ] && [ -x "${CUDA_HOME}/bin/nvcc" ]; then
+    HAVE_CUDA=1
+    export PATH="${CUDA_HOME}/bin:${PATH}"
+    log "Building with CUDA support (targets: ${NIXL_CUDA_ARCH_LIST})"
+else
+    HAVE_CUDA=0
+    log "Building CPU-only (no CUDA)"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Python build + runtime dependencies (system interpreter)
 # ---------------------------------------------------------------------------
 log "Installing Python build/runtime dependencies"
 # Install with sudo so console scripts (uv, meson, ninja) land on the system
@@ -45,16 +90,32 @@ log "Installing Python build/runtime dependencies"
 # on the system interpreter's sys.path.
 PIP="sudo pip3 install --no-cache-dir --break-system-packages"
 $PIP meson ninja pybind11 patchelf tomlkit pyyaml uv numpy
-# CPU-only PyTorch (no CUDA in the Cloud Agent VM). Needed by the examples/tests.
-$PIP torch --index-url https://download.pytorch.org/whl/cpu
+if [ "${HAVE_CUDA}" = "1" ]; then
+    # Default PyPI Linux wheel is the CUDA build (bundles its own CUDA runtime).
+    $PIP torch
+else
+    $PIP torch --index-url https://download.pytorch.org/whl/cpu
+fi
 
 # ---------------------------------------------------------------------------
-# 3. UCX (skip if a matching version is already installed)
+# 4. UCX (rebuilt when missing, or when CUDA support is needed but absent)
 # ---------------------------------------------------------------------------
-if pkg-config --modversion ucx 2>/dev/null | grep -q '^1\.23'; then
-    log "UCX $(pkg-config --modversion ucx) already installed; skipping"
+ucx_ok() {
+    pkg-config --modversion ucx 2>/dev/null | grep -q '^1\.23' || return 1
+    if [ "${HAVE_CUDA}" = "1" ]; then
+        # Require the CUDA UCT module to be present for a CUDA-enabled UCX.
+        [ -e "${PREFIX}/lib/ucx/libuct_cuda.so" ]
+    fi
+}
+if ucx_ok; then
+    log "UCX $(pkg-config --modversion ucx) already installed with required features; skipping"
 else
-    log "Building UCX ${UCX_VERSION} from source"
+    if [ "${HAVE_CUDA}" = "1" ]; then
+        UCX_CUDA_ARG="--with-cuda=${CUDA_HOME}"
+    else
+        UCX_CUDA_ARG="--without-cuda"
+    fi
+    log "Building UCX ${UCX_VERSION} from source (${UCX_CUDA_ARG})"
     UCX_TMP="$(mktemp -d)"
     git clone --depth 1 -b "${UCX_VERSION}" https://github.com/openucx/ucx.git "${UCX_TMP}/ucx"
     (
@@ -65,7 +126,7 @@ else
             --enable-shared --disable-static \
             --disable-doxygen-doc --enable-optimizations \
             --without-avx --enable-cma --enable-devel-headers \
-            --without-gdrcopy --without-cuda
+            --without-gdrcopy "${UCX_CUDA_ARG}"
         make -j"${NPROC}"
         sudo make -j install-strip
     )
@@ -74,7 +135,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Abseil (NIXL needs a newer Abseil than Ubuntu ships; the meson wrap patch
+# 5. Abseil (NIXL needs a newer Abseil than Ubuntu ships; the meson wrap patch
 #    host is not reachable under restricted egress, so install it system-wide)
 # ---------------------------------------------------------------------------
 if pkg-config --exists absl_log_initialize 2>/dev/null; then
@@ -104,23 +165,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. NIXL (always rebuilt from the checked-out source)
+# 6. NIXL (always rebuilt from the checked-out source)
 # ---------------------------------------------------------------------------
 log "Building and installing NIXL"
 cd "${REPO_ROOT}"
+NIXL_PLUGINS="UCX,POSIX"
+NIXL_CUDA_ARGS=()
+if [ "${HAVE_CUDA}" = "1" ]; then
+    # meson auto-detects nvcc (on PATH) and compiles the CUDA/VRAM code paths.
+    NIXL_CUDA_ARGS=(-Dnixl_cuda_arch_list="${NIXL_CUDA_ARCH_LIST}")
+    # GPUDirect Storage plugin needs cuFile headers, shipped with the toolkit.
+    [ -f "${CUDA_HOME}/include/cufile.h" ] && NIXL_PLUGINS="${NIXL_PLUGINS},GDS"
+fi
 rm -rf build
 meson setup build \
     --prefix="${PREFIX}" \
     -Ducx_path="${PREFIX}" \
-    -Denable_plugins=UCX,POSIX \
+    -Denable_plugins="${NIXL_PLUGINS}" \
+    "${NIXL_CUDA_ARGS[@]}" \
     -Drust=false -Dbuild_docs=false -Dbuild_tests=false -Dbuild_examples=false
 ninja -C build
 sudo ninja -C build install
 
 # Make the freshly installed NIXL/UCX/Abseil libraries discoverable globally so
-# that `import nixl` works without any per-shell environment variables.
-echo -e "${PREFIX}/lib\n${PREFIX}/lib/x86_64-linux-gnu" | \
-    sudo tee /etc/ld.so.conf.d/nixl.conf >/dev/null
+# that `import nixl` works without any per-shell environment variables. Include
+# the CUDA runtime libdir for CUDA builds (libcudart, libcufile, ...). The
+# NVIDIA *driver* (libcuda.so.1) is provided by a GPU host; when absent, UCX
+# simply skips its CUDA transport at runtime and the DRAM path still works.
+{
+    echo "${PREFIX}/lib"
+    echo "${PREFIX}/lib/x86_64-linux-gnu"
+    [ "${HAVE_CUDA}" = "1" ] && echo "${CUDA_HOME}/lib64"
+} | sudo tee /etc/ld.so.conf.d/nixl.conf >/dev/null
 sudo ldconfig
 
 # meson installs the extension modules (nixl_cu12) into
