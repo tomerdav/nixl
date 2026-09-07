@@ -1,0 +1,5 @@
+{
+  "name": "NIXL (build-time CUDA dev)",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh"
+}
