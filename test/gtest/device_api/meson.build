@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Device API test utilities and sources
-device_api_inc_dirs = include_directories('.')
-
-device_api_sources = [
+# The proxy producer depends on CUDA and the host proxy runtime, but not on
+# UCX's direct GPU API. Keep it separate so it still runs on the configurations
+# where the proxy is the required fallback.
+proxy_device_api_test_sources = files(
     'proxy_write_test.cu',
-    'single_write_test.cu',
-    'utils.cu'
-]
+)
 
-# Export for parent meson.build
-device_api_test_sources = files(device_api_sources)
+ucx_device_api_test_sources = files(
+    'single_write_test.cu',
+    'utils.cu',
+)
