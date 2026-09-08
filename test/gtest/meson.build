@@ -53,7 +53,7 @@ subdir('mocks')
 subdir('unit')
 subdir('plugins')
 
-if ucx_gpu_device_api_available
+if cuda_dep.found()
     subdir('device_api')
 endif
 
@@ -119,17 +119,18 @@ gtest_sources = [
     'configuration.cpp'
     ]
 
-if ucx_gpu_device_api_available
-    gtest_sources += device_api_test_sources
+if cuda_dep.found()
+    gtest_sources += proxy_device_api_test_sources
     device_api_inc = nixl_device_api_inc_dirs + [include_directories('device_api')]
-    device_api_dep = [ucx_dep, doca_gpunetio_dep]
-    # The proxy test drives the runtime and the memview wrapper directly.
-    if is_variable('device_proxy_interface')
-        device_api_dep += [device_proxy_interface]
-    endif
+    device_api_dep = [device_proxy_interface]
 else
     device_api_inc = []
     device_api_dep = []
+endif
+
+if ucx_gpu_device_api_available
+    gtest_sources += ucx_device_api_test_sources
+    device_api_dep += [ucx_dep, doca_gpunetio_dep]
 endif
 
 if ucx_dep.found() and is_variable('ucx_backend_interface')
