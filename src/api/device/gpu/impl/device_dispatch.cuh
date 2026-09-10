@@ -94,11 +94,16 @@ namespace detail {
     writeExecutionMode(xferStatusH *status,
                        nixl_status_t submission_status,
                        exec_mode_t execution_mode) {
-        if (status == nullptr || submission_status < 0 || !executionLeader<level>()) {
-            return;
+        if (status != nullptr && submission_status >= 0 && executionLeader<level>()) {
+            const uint32_t mode = static_cast<uint32_t>(execution_mode);
+            memcpy(status->storage + xfer_status_payload_size, &mode, sizeof(mode));
         }
-        const uint32_t mode = static_cast<uint32_t>(execution_mode);
-        memcpy(status->storage + xfer_status_payload_size, &mode, sizeof(mode));
+        // Collective pollers share the leader's tag.
+        if constexpr (level == level_t::WARP) {
+            __syncwarp();
+        } else if constexpr (level == level_t::BLOCK) {
+            __syncthreads();
+        }
     }
 
 } // namespace detail
