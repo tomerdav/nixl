@@ -117,6 +117,8 @@ nixlUcxEngine::create(const nixlBackendInitParams &init_params) {
         derived_params["num_workers"] = std::to_string(derived_workers);
         nixlBackendInitParams proxy_init_params = init_params;
         proxy_init_params.customParams = &derived_params;
+        // Proxy progress can overlap metadata operations under any agent lock mode.
+        proxy_init_params.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
 
         auto engine = std::unique_ptr<nixlUcxEngine>(new nixlUcxEngine(proxy_init_params));
         // The workers exist and the engine is fully constructed; starting the
@@ -280,7 +282,7 @@ nixlUcxEngine::setupProxyRuntime(const nixlProxyConfig &config) {
         NIXL_DEBUG << "device proxy submit: opcode=" << static_cast<int>(submission.opcode)
                    << " src_addr=0x" << std::hex << submission.local.desc.addr << " dst_addr=0x"
                    << submission.remote.desc.addr << std::dec << " size=" << submission.size
-                   << " remote_agent='" << submission.remote_agent << "' token=" << request.token
+                   << " token=" << request.token
                    << " context=" << request.context << " status=" << status;
         return status;
     };
@@ -302,10 +304,23 @@ nixlUcxEngine::setupProxyRuntime(const nixlProxyConfig &config) {
         return status;
     };
 
-    ops.release_request = [this](const nixlBackendProxyRequest &request) {
-        if (request) {
-            releaseProxyRequest(request.context, proxyReqFromToken(request));
+    ops.quiesce = [this, worker_id_for](uint32_t channel, uint32_t peer) {
+        const auto &worker = getSharedWorker(worker_id_for(channel, peer));
+        const ucp_request_param_t params{};
+        auto *request = ucp_worker_flush_nbx(worker->get(), &params);
+        if (UCS_PTR_IS_ERR(request)) {
+            return nixl::ucx::ucsToNixlStatus(UCS_PTR_STATUS(request));
         }
+        if (request == nullptr) {
+            return NIXL_SUCCESS;
+        }
+        ucs_status_t status;
+        do {
+            worker->progress();
+            status = ucp_request_check_status(request);
+        } while (status == UCS_INPROGRESS);
+        worker->reqRelease(request);
+        return nixl::ucx::ucsToNixlStatus(status);
     };
 
     ops.progress = [this, worker_id_for](uint32_t channel_id, uint32_t peer_index) {
@@ -415,23 +430,9 @@ nixl_status_t nixlUcxEngine::loadRemoteConnInfo (const std::string &remote_agent
 
     nixlSerDes::_stringToBytes(addr.data(), remote_conn_info, size);
     std::shared_ptr<nixlUcxConnection> conn = std::make_shared<nixlUcxConnection>();
-    std::function<void()> on_failed;
-#ifdef HAVE_NIXL_DEVICE_API
-    // Under err-mode none the proxy gets no keepalive, but an endpoint with
-    // traffic in flight still fails once the transport gives up retransmitting,
-    // and UCP invokes the handler anyway. Any one of this agent's endpoints
-    // failing means the agent is gone.
-    if (proxyRuntime_) {
-        on_failed = [this, remote_agent]() {
-            if (proxyRuntime_) {
-                proxyRuntime_->remoteFailed(remote_agent);
-            }
-        };
-    }
-#endif
 
     for (const auto &uw : workers_) {
-        std::unique_ptr<nixlUcxEp> ep = uw->connect(addr.data(), on_failed);
+        std::unique_ptr<nixlUcxEp> ep = uw->connect(addr.data());
         if (!ep) {
             return NIXL_ERR_BACKEND;
         }
@@ -1157,7 +1158,7 @@ nixlUcxEngine::wrapMemView(nixlMemViewH backend_mvh, nixlMemViewH &mvh) const {
     const nixl_status_t status = nixlDeviceMemViewAllocate(mode, backend_mvh, mvh);
     if (status != NIXL_SUCCESS) {
         if (proxyRuntime_) {
-            static_cast<void>(proxyRuntime_->unregisterProxyMemView(backend_mvh));
+            static_cast<void>(proxyRuntime_->discardUnpublishedMemView(backend_mvh));
         } else {
             nixl::ucx::releaseMemList(backend_mvh);
         }
@@ -1187,23 +1188,19 @@ nixlUcxEngine::releaseMemView(nixlMemViewH mem_view) const {
 
     nixlMemViewH backend_mvh = nullptr;
     if (nixlDeviceMemViewGetBackend(mem_view, backend_mvh) != NIXL_SUCCESS) {
+        if (proxyRuntime_) {
+            NIXL_FATAL << "Failed to read proxy memory view before retirement";
+        }
         NIXL_ERROR << "Failed to read device memview wrapper for handle " << mem_view;
         nixlDeviceMemViewFree(mem_view);
         return;
     }
 
     if (proxyRuntime_) {
-        // Resolve before unregistering: retiring the entry is what makes the
-        // backend handle unreachable, and it is still ours to release.
-        nixlMemViewH resolved = nullptr;
-        static_cast<void>(proxyRuntime_->resolveProxyMemView(backend_mvh, resolved));
         const nixl_status_t status = proxyRuntime_->unregisterProxyMemView(backend_mvh);
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to release proxy memory view " << mem_view << " with status "
+            NIXL_FATAL << "Failed to release proxy memory view " << mem_view << " with status "
                        << status;
-        }
-        if (resolved != nullptr) {
-            nixl::ucx::releaseMemList(resolved);
         }
     } else {
         nixl::ucx::releaseMemList(backend_mvh);

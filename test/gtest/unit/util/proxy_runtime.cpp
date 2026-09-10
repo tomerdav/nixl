@@ -596,7 +596,9 @@ namespace proxy_runtime {
         backend_.complete(backend_.token(0));
         backend_.complete(backend_.token(1));
         ASSERT_TRUE(
-            waitFor([&]() { return completedIdx(striped) == 5u && completedIdx(middle) == 6u; }));
+            waitFor([&]() { return consumerIdx(striped) == 1u && consumerIdx(middle) == 1u; }));
+        EXPECT_EQ(completedIdx(striped), 5u);
+        EXPECT_EQ(completedIdx(middle), 6u);
         EXPECT_EQ(consumerIdx(striped), 1u);
         EXPECT_EQ(consumerIdx(middle), 1u);
         EXPECT_EQ(consumerIdx(idle), 0u);
@@ -726,6 +728,24 @@ namespace proxy_runtime {
         EXPECT_TRUE(done.load());
         EXPECT_TRUE(allocator_.wasFreed(dst));
         EXPECT_EQ(backend_.quiesceCalls(), 2u);
+    }
+
+    TEST_F(ProxyRuntimeTest, UnpublishedRollbackDoesNotDrainLiveTraffic) {
+        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
+        nixlMemViewH src = nullptr, dst = nullptr;
+        prepMemViews(src, dst);
+        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
+        publish(channel(), 0, makePut(src, dst), 1);
+        ASSERT_TRUE(waitFor([&] { return backend_.submissionCount() == 1; }));
+        nixlMemViewH unpublished = nullptr;
+        ASSERT_EQ(runtime_->prepMemView(makeLocalDlist(0x3000, 64, 0, &local_md_), &unpublished),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(runtime_->discardUnpublishedMemView(unpublished), NIXL_SUCCESS);
+        EXPECT_TRUE(allocator_.wasFreed(unpublished));
+        EXPECT_FALSE(allocator_.wasFreed(dst));
+        EXPECT_EQ(backend_.quiesceCalls(), 0u);
+        backend_.completeEverything();
+        EXPECT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
     }
 
     TEST_F(ProxyRuntimeTest, RetirementSelectsTheOwningDevice) {
