@@ -15,7 +15,7 @@
 
 gdrcopy_lib = cpp.find_library('gdrapi', required: false)
 device_proxy_cpp_args = []
-device_proxy_deps = [nixl_common_dep, device_utils_interface]
+device_proxy_deps = [nixl_common_dep, nixl_infra, device_utils_interface]
 if gdrcopy_lib.found() and cpp.has_header('gdrapi.h')
     device_proxy_cpp_args += ['-DHAVE_GDRCOPY']
     device_proxy_deps += [gdrcopy_lib]

@@ -21,6 +21,7 @@ util_unit_test_sources = [
 if is_variable('device_proxy_interface')
     util_unit_test_sources += [
         'proxy_memview_registry.cpp',
+        'proxy_registry_lifetime.cpp',
     ]
 endif
 
