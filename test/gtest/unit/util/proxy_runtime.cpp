@@ -595,8 +595,9 @@ namespace proxy_runtime {
         // Completions land in their own ring and nowhere else.
         backend_.complete(backend_.token(0));
         backend_.complete(backend_.token(1));
-        ASSERT_TRUE(
-            waitFor([&]() { return completedIdx(striped) == 5u && completedIdx(middle) == 6u; }));
+        ASSERT_TRUE(waitFor([&]() { return consumerIdx(striped) == 1u && consumerIdx(middle) == 1u; }));
+        EXPECT_EQ(completedIdx(striped), 5u);
+        EXPECT_EQ(completedIdx(middle), 6u);
         EXPECT_EQ(consumerIdx(striped), 1u);
         EXPECT_EQ(consumerIdx(middle), 1u);
         EXPECT_EQ(consumerIdx(idle), 0u);
