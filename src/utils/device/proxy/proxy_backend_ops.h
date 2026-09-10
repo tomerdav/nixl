@@ -34,7 +34,7 @@ struct nixlBackendProxyXferDesc {
     nixlMetaDesc desc{};
 };
 
-/** A ring record with its memview ids resolved into transport descriptors. */
+/** A ring record with its view tokens resolved into transport descriptors. */
 struct nixlBackendProxySubmission {
     uint64_t op_idx = 0;
     nixl_proxy_opcode_t opcode = nixl_proxy_opcode_t::PUT;
@@ -44,7 +44,6 @@ struct nixlBackendProxySubmission {
 
     nixlBackendProxyXferDesc local{};
     nixlBackendProxyXferDesc remote{};
-    std::string remote_agent;
 
     size_t size = 0;
     uint64_t value = 0;
