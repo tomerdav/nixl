@@ -123,23 +123,18 @@ nixlProxyChannelState::rearm() noexcept {
     return NIXL_SUCCESS;
 }
 
-size_t
-nixlProxyChannelState::releaseInflightRequests(const nixlProxyBackendOps &backend_ops) noexcept {
-    if (ring_depth_ == 0 || consumer_idx_dev_ == nullptr || !backend_ops.release_request) {
-        return 0;
+void
+nixlProxyChannelState::verifyDrained() const noexcept {
+    if (!allocated()) {
+        return;
     }
-
-    size_t released = 0;
-    for (uint64_t idx = consumer_idx_shadow_; idx < submit_idx_; ++idx) {
-        nixlProxyRequestState &inflight = inflight_slots_[idx % ring_depth_];
-        if (inflight.status == NIXL_IN_PROG && inflight.backend_request) {
-            backend_ops.release_request(inflight.backend_request);
-            ++released;
-        }
-        inflight = nixlProxyRequestState{};
+    uint64_t produced = 0;
+    if (!drained() ||
+        allocator_->copyDeviceToHost(&produced, producer_idx_mem_.get(), sizeof(produced)) !=
+            NIXL_SUCCESS ||
+        produced != submit_idx_) {
+        NIXL_FATAL << "Proxy ring has unfinished or unpublished producer tickets";
     }
-    submit_idx_ = consumer_idx_shadow_;
-    return released;
 }
 
 bool
@@ -255,10 +250,8 @@ nixlProxyRuntime::build() {
     for (uint32_t channel_idx = 0; channel_idx < channel_count; channel_idx++) {
         for (uint32_t peer_idx = 0; peer_idx < max_peers; peer_idx++) {
             const size_t slot = static_cast<size_t>(channel_idx) * max_peers + peer_idx;
-            rc = channels_[slot].allocate(allocator_,
-                                          config_.ring_depth,
-                                          &control_slots_,
-                                          kProxyCiSlotBase + slot);
+            rc = channels_[slot].allocate(
+                allocator_, config_.ring_depth, &control_slots_, kProxyCiSlotBase + slot);
             if (rc != NIXL_SUCCESS) {
                 return rc;
             }
@@ -315,6 +308,7 @@ nixl_status_t
 nixlProxyRuntime::loadRemoteConnInfo(const std::string &remote_name, const nixl_blob_t &conn_info) {
     NIXL_INFO << "ProxyRuntime::loadRemoteConnInfo: remote='" << remote_name
               << "' conn_info_size=" << conn_info.size();
+
     if (!backend_ops_.on_remote_loaded) {
         return NIXL_SUCCESS;
     }
@@ -334,6 +328,7 @@ nixlProxyRuntime::remoteDisconnected(const std::string &remote_name) {
 
 nixl_status_t
 nixlProxyRuntime::prepMemView(const nixl_meta_dlist_t &dlist, nixlMemViewH *proxy_memview) {
+    const std::lock_guard lock(control_mutex_);
     if (proxy_memview == nullptr || memview_registry_ == nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
@@ -342,9 +337,11 @@ nixlProxyRuntime::prepMemView(const nixl_meta_dlist_t &dlist, nixlMemViewH *prox
 
 nixl_status_t
 nixlProxyRuntime::prepMemView(const nixl_remote_meta_dlist_t &dlist, nixlMemViewH *proxy_memview) {
+    const std::lock_guard lock(control_mutex_);
     if (proxy_memview == nullptr || memview_registry_ == nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
+
 
     std::vector<void *> direct_ptrs;
     if (backend_ops_.resolve_direct_ptrs) {
@@ -359,6 +356,7 @@ nixlProxyRuntime::prepMemView(const nixl_remote_meta_dlist_t &dlist, nixlMemView
 
 nixl_status_t
 nixlProxyRuntime::unregisterProxyMemView(nixlMemViewH proxy_memview) {
+    const std::lock_guard lock(control_mutex_);
     if (memview_registry_ == nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
@@ -373,13 +371,8 @@ nixlProxyRuntime::unregisterProxyMemView(nixlMemViewH proxy_memview) {
 void
 nixlProxyRuntime::drainChannels() noexcept {
     if (!workers_started_) {
-        // Nobody is progressing the rings, so there is nothing to wait for and
-        // nobody to race: do the whole thing here.
-        for (auto &channel : channels_) {
-            static_cast<void>(channel.releaseInflightRequests(backend_ops_));
-            if (channel.allocated() && channel.rearm() != NIXL_SUCCESS) {
-                NIXL_ERROR << "ProxyRuntime::drainChannels: failed to rearm a channel";
-            }
+        for (const auto &channel : channels_) {
+            channel.verifyDrained();
         }
         return;
     }
@@ -389,25 +382,16 @@ nixlProxyRuntime::drainChannels() noexcept {
         while (worker->drainAcked() < requested) {
             if (shutdown_state_.load(std::memory_order_acquire) !=
                 static_cast<uint64_t>(nixl_proxy_control_state_t::RUNNING)) {
-                NIXL_WARN << "ProxyRuntime::drainChannels: shutting down mid-drain";
-                return;
+                NIXL_FATAL << "Proxy runtime stopped during drain";
             }
             std::this_thread::yield();
         }
     }
 }
 
-bool
-nixlProxyRuntime::resolveProxyMemView(nixlMemViewH proxy_memview,
-                                      nixlMemViewH &backend_memview) const {
-    if (memview_registry_ == nullptr) {
-        return false;
-    }
-    return memview_registry_->resolve(proxy_memview, backend_memview);
-}
-
 nixl_status_t
 nixlProxyRuntime::startWorkers() {
+    const std::lock_guard lock(control_mutex_);
     NIXL_INFO << "ProxyRuntime::startWorkers: launching " << workers_.size() << " worker thread(s)";
     if (!control_slots_.allocated()) {
         NIXL_ERROR << "ProxyRuntime::startWorkers: runtime not initialized";
@@ -446,58 +430,33 @@ nixlProxyRuntime::joinWorkerThreads() noexcept {
 
 nixl_status_t
 nixlProxyRuntime::shutdown() {
-    NIXL_INFO << "ProxyRuntime::shutdown: signalling workers to stop";
-    nixl_status_t shutdown_signal_status = NIXL_SUCCESS;
-    if (control_slots_.allocated()) {
-        shutdown_signal_status = control_slots_.writeSlot(
-            kProxyShutdownSlot, static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN));
-        if (shutdown_signal_status != NIXL_SUCCESS) {
-            NIXL_ERROR << "ProxyRuntime::shutdown: failed to publish SHUTDOWN state";
-        }
+    const std::lock_guard lock(control_mutex_);
+    if (!backend_ops_.shutdown) {
+        return NIXL_SUCCESS;
+    }
+    if (workers_started_ &&
+        control_slots_.writeSlot(kProxyShutdownSlot,
+                                 static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN)) !=
+            NIXL_SUCCESS) {
+        NIXL_FATAL << "Failed to publish proxy shutdown";
+    }
+    // A failed build has never handed a context to a producer.
+    if (memview_registry_) {
+        drainChannels();
     }
     shutdown_state_.store(static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN),
                           std::memory_order_release);
-
     joinWorkerThreads();
     workers_started_ = false;
-    NIXL_INFO << "ProxyRuntime::shutdown: all worker threads joined";
-
-    size_t released = 0;
-    for (auto &channel : channels_) {
-        released += channel.releaseInflightRequests(backend_ops_);
-    }
-    if (released != 0) {
-        NIXL_INFO << "ProxyRuntime::shutdown: released " << released
-                  << " pending backend request(s)";
-    }
-
-    nixl_status_t backend_status = NIXL_SUCCESS;
-    if (backend_ops_.shutdown) {
-        NIXL_INFO << "ProxyRuntime::shutdown: shutting down backend";
-        backend_status = backend_ops_.shutdown();
-        NIXL_INFO << "ProxyRuntime::shutdown: backend shutdown status=" << backend_status;
-    }
-
     workers_.clear();
-    // Workers are joined, so nothing can be resolving a memview any more; the
-    // registry takes every device memview still alive down with it.
     memview_registry_.reset();
-
     device_context_mem_.reset();
     shutdown_word_dev_ = nullptr;
     device_channel_views_mem_.reset();
     device_channel_views_.clear();
     channels_.clear();
     control_slots_.deallocate();
-    // Drop the callbacks last: they are what makes a second shutdown a no-op,
-    // and they may own state belonging to the backend that is going away.
+    const nixl_status_t status = backend_ops_.shutdown();
     backend_ops_ = nixlProxyBackendOps{};
-    NIXL_INFO << "ProxyRuntime::shutdown: complete";
-    if (backend_status != NIXL_SUCCESS) {
-        return backend_status;
-    }
-    if (shutdown_signal_status != NIXL_SUCCESS) {
-        return shutdown_signal_status;
-    }
-    return NIXL_SUCCESS;
+    return status;
 }

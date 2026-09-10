@@ -293,9 +293,10 @@ namespace proxy_mocks {
                 const auto it = completed_.find(request.token);
                 return it == completed_.end() ? NIXL_IN_PROG : it->second;
             };
-            ops.release_request = [this](const nixlBackendProxyRequest &request) {
+            ops.quiesce = [this](uint32_t, uint32_t) {
                 const std::lock_guard<std::mutex> lock(mutex_);
-                released_.push_back(request.token);
+                ++quiesce_calls_;
+                return NIXL_SUCCESS;
             };
             ops.progress = [](uint32_t, uint32_t) { return NIXL_SUCCESS; };
             ops.shutdown = [this]() {
@@ -390,10 +391,10 @@ namespace proxy_mocks {
             return index < tokens_.size() ? tokens_[index] : 0;
         }
 
-        std::vector<uint64_t>
-        released() const {
+        size_t
+        quiesceCalls() const {
             const std::lock_guard<std::mutex> lock(mutex_);
-            return released_;
+            return quiesce_calls_;
         }
 
         uint32_t
@@ -424,7 +425,7 @@ namespace proxy_mocks {
         mutable std::mutex mutex_;
         std::vector<nixlBackendProxySubmission> submissions_;
         std::vector<uint64_t> tokens_;
-        std::vector<uint64_t> released_;
+        size_t quiesce_calls_ = 0;
         std::vector<nixl_status_t> submit_statuses_;
         std::map<uint64_t, nixl_status_t> completed_;
         std::map<uint64_t, uint32_t> token_peer_;
