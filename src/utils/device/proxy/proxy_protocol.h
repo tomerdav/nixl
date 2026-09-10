@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include <nixl_types.h>
 
@@ -32,7 +33,7 @@
 #endif
 
 /** Increment when the wire layout becomes incompatible. */
-inline constexpr uint32_t kProxyProtocolVersion = 1;
+inline constexpr uint32_t kProxyProtocolVersion = 2;
 
 enum class nixl_proxy_opcode_t : uint8_t {
     PUT = 0,
@@ -48,9 +49,10 @@ struct nixlProxyDeviceContextData;
 
 /** A prepared memory view as device code sees it; `direct_ptr_count` pointers follow it. */
 struct nixlProxyDeviceMemView {
-    uint32_t proxy_memview_id = 0;
-    uint32_t direct_ptr_count = 0;
+    uint64_t host_view = 0;
     const nixlProxyDeviceContextData *context = nullptr;
+    uint32_t direct_ptr_count = 0;
+    uint32_t reserved = 0;
 };
 
 NIXL_PROXY_PROTO_FN void **
@@ -72,18 +74,17 @@ nixlProxyDeviceMemViewBytes(size_t count) {
 /** A GPU-submitted PUT or atomic-add operation for the CPU proxy to execute. */
 struct alignas(64) nixlProxySubmission {
     uint64_t op_idx = 0;
-    uint64_t value = 0;
-    uint64_t src_offset = 0;
+    uint64_t operand = 0; // PUT: source offset; ATOMIC_ADD: value.
     uint64_t dst_offset = 0;
     uint64_t size = 0;
+    uint64_t src_view = 0;
+    uint64_t dst_view = 0;
+    uint32_t src_index = 0;
+    uint32_t dst_index = 0;
     nixl_proxy_opcode_t opcode = nixl_proxy_opcode_t::PUT;
     uint8_t flags = 0;
     uint16_t channel_id = 0;
     uint32_t reserved = 0;
-    uint32_t src_index = 0;
-    uint32_t dst_index = 0;
-    uint32_t src_proxy_memview_id = 0;
-    uint32_t dst_proxy_memview_id = 0;
 };
 
 struct nixlProxyWorkRing {
@@ -125,9 +126,15 @@ static_assert(offsetof(nixlProxySubmission, op_idx) == 0,
               "op_idx must be the first word because it publishes record readiness");
 static_assert(alignof(nixlProxySubmission) == 64, "nixlProxySubmission must be cache-line aligned");
 
-static_assert(sizeof(nixlProxyDeviceMemView) == 16, "nixlProxyDeviceMemView layout changed");
-static_assert(offsetof(nixlProxyDeviceMemView, proxy_memview_id) == 0,
+static_assert(std::is_trivially_copyable_v<nixlProxySubmission>);
+static_assert(offsetof(nixlProxySubmission, src_view) == 32);
+static_assert(offsetof(nixlProxySubmission, src_index) == 48);
+static_assert(offsetof(nixlProxySubmission, opcode) == 56);
+static_assert(sizeof(uintptr_t) <= sizeof(uint64_t));
+static_assert(sizeof(nixlProxyDeviceMemView) == 24, "nixlProxyDeviceMemView layout changed");
+static_assert(offsetof(nixlProxyDeviceMemView, host_view) == 0,
               "nixlProxyDeviceMemView layout changed");
+static_assert(offsetof(nixlProxyDeviceMemView, context) == 8);
 static_assert(sizeof(nixlProxyDeviceMemView) % alignof(void *) == 0,
               "the trailing direct-pointer run must start aligned");
 
