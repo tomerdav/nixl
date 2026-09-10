@@ -66,6 +66,13 @@ parameters. EP translates these environment variables into them:
 
 Kernels and Device API calls are identical in both modes.
 
+Proxy view release waits for queued operations and UCX transport cleanup. Stop
+and synchronize producers before releasing views or deregistering their buffers.
+Disconnect releases old views before invalidating metadata or removing peer resources.
+A dead peer need not receive the data, but cleanup can wait for transport retry
+timeouts (including connection setup). `UCX_RC_TIMEOUT`, `UCX_RC_RETRY_COUNT`, and
+`UCX_UD_TIMEOUT` affect this delay; EP does not change their production defaults.
+
 There is no library-level environment override for this. Outside EP, the proxy
 is enabled by passing `device_proxy=true`, plus any `proxy_*` parameters, to
 `createBackend("UCX", ...)`.
