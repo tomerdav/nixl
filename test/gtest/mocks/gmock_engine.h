@@ -102,6 +102,7 @@ public:
                  nixlMemViewH &mvh,
                  const nixl_opt_b_args_t *opt_args),
                 (const, override));
+    MOCK_METHOD(void, releaseMemView, (nixlMemViewH mvh), (const, override));
     MOCK_METHOD(nixl_status_t,
                 getPublicData,
                 (const nixlBackendMD *input, std::string &str),
