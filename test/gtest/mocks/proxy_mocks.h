@@ -26,10 +26,12 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "backend_aux.h"
 #include "device/device_allocator.h"
+#include "device/proxy/proxy_backend_ops.h"
 
 namespace gtest {
 namespace proxy_mocks {
@@ -52,8 +54,14 @@ namespace proxy_mocks {
      */
     class MockDeviceAllocator : public nixlDeviceAllocator {
     public:
+        /** Fail once after N allocation/H2D calls; -1 disables injection. */
+        int fail_after = -1;
+
         nixl_status_t
         copyHostToDevice(void *dst, const void *src, size_t size) noexcept override {
+            if (fail_after >= 0 && fail_after-- == 0) {
+                return NIXL_ERR_BACKEND;
+            }
             std::memcpy(resolve(dst), src, size);
             return NIXL_SUCCESS;
         }
@@ -127,6 +135,9 @@ namespace proxy_mocks {
     protected:
         nixl_status_t
         doAllocDeviceMem(void **ptr, size_t size) noexcept override {
+            if (fail_after >= 0 && fail_after-- == 0) {
+                return NIXL_ERR_BACKEND;
+            }
             void *allocation = allocate(size);
             if (allocation == nullptr) {
                 return NIXL_ERR_BACKEND;
@@ -237,6 +248,7 @@ namespace proxy_mocks {
         desc.metadataP = md;
         return desc;
     }
+
 
 } // namespace proxy_mocks
 } // namespace gtest

@@ -25,30 +25,19 @@
 nixlProxyMemViewRegistry::nixlProxyMemViewRegistry(nixlDeviceAllocator &allocator,
                                                    const nixlProxyDeviceContextData *device_context)
     : allocator_(allocator),
-      device_context_(device_context),
-      by_id_(kMaxProxyMemViews) {}
+      device_context_(device_context) {}
 
-const nixlProxyMemViewRegistry::RegistryEntry *
-nixlProxyMemViewRegistry::entryForId(uint64_t proxy_memview_id) const noexcept {
-    if (proxy_memview_id == 0 || proxy_memview_id > by_id_.size()) {
-        return nullptr;
-    }
-    return by_id_[proxy_memview_id - 1].load(std::memory_order_acquire);
-}
-
+template<typename DlistT>
 nixl_status_t
-nixlProxyMemViewRegistry::createEntryLocked(const std::vector<void *> &direct_ptrs,
+nixlProxyMemViewRegistry::createEntryLocked(const DlistT &dlist,
+                                            const std::vector<void *> &direct_ptrs,
                                             RegistryEntry *&out) {
     out = nullptr;
 
-    if (owned_.size() >= by_id_.size()) {
-        NIXL_ERROR << "nixlProxyMemViewRegistry: memview capacity exhausted after " << by_id_.size()
-                   << " registrations";
-        return NIXL_ERR_BACKEND;
-    }
-
     auto entry = std::make_unique<RegistryEntry>();
-    entry->id = static_cast<uint32_t>(owned_.size() + 1);
+    entry->remote = std::is_same_v<DlistT, nixl_remote_meta_dlist_t>;
+    entry->mem_type = dlist.getType();
+    fillDescs(dlist, entry->descs);
 
     const size_t direct_ptr_bytes = direct_ptrs.size() * sizeof(void *);
     const size_t allocation_size = nixlProxyDeviceMemViewBytes(direct_ptrs.size());
@@ -61,13 +50,14 @@ nixlProxyMemViewRegistry::createEntryLocked(const std::vector<void *> &direct_pt
     auto *device_memview = device_memview_mem.as<nixlProxyDeviceMemView>();
 
     const nixlProxyDeviceMemView host_memview{
-        entry->id, static_cast<uint32_t>(direct_ptrs.size()), device_context_};
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(entry.get())),
+        device_context_,
+        static_cast<uint32_t>(direct_ptrs.size())};
     nixl_status_t copy_status =
         allocator_.copyHostToDevice(device_memview, &host_memview, sizeof(host_memview));
     if (copy_status == NIXL_SUCCESS && !direct_ptrs.empty()) {
-        copy_status = allocator_.copyHostToDevice(nixlProxyDeviceMemViewDirectPtrs(device_memview),
-                                                  direct_ptrs.data(),
-                                                  direct_ptr_bytes);
+        copy_status = allocator_.copyHostToDevice(
+            nixlProxyDeviceMemViewDirectPtrs(device_memview), direct_ptrs.data(), direct_ptr_bytes);
     }
     if (copy_status != NIXL_SUCCESS) {
         NIXL_ERROR << "nixlProxyMemViewRegistry: failed to initialize device memview";
@@ -76,12 +66,8 @@ nixlProxyMemViewRegistry::createEntryLocked(const std::vector<void *> &direct_pt
 
     entry->proxy_memview = device_memview;
     entry->proxy_memview_mem = std::move(device_memview_mem);
-    handle_to_id_.emplace(entry->proxy_memview, entry->id);
-
-    // Nothing before this point consumed an id, so a failed prep leaves the
-    // registry exactly as it was.
     out = entry.get();
-    owned_.push_back(std::move(entry));
+    views_.emplace(device_memview, std::move(entry));
     return NIXL_SUCCESS;
 }
 
@@ -90,20 +76,13 @@ nixlProxyMemViewRegistry::prepLocal(const nixl_meta_dlist_t &dlist, nixlMemViewH
     const std::lock_guard<std::mutex> lock(ctrl_mutex_);
 
     RegistryEntry *entry = nullptr;
-    const nixl_status_t status = createEntryLocked({}, entry);
+    const nixl_status_t status = createEntryLocked(dlist, {}, entry);
     if (status != NIXL_SUCCESS) {
         return status;
     }
 
-    entry->remote = false;
-    entry->mem_type = dlist.getType();
-    fillDescs(dlist, entry->descs);
-    // Publishes the entry: everything above happens-before the acquire load in
-    // entryForId().
-    by_id_[entry->id - 1].store(entry, std::memory_order_release);
-
     out = entry->proxy_memview;
-    NIXL_DEBUG << "nixlProxyMemViewRegistry::prepLocal: proxy_id=" << entry->id
+    NIXL_DEBUG << "nixlProxyMemViewRegistry::prepLocal: host_view=" << entry
                << " descs=" << dlist.descCount();
     return NIXL_SUCCESS;
 }
@@ -112,8 +91,6 @@ nixl_status_t
 nixlProxyMemViewRegistry::prepRemote(const nixl_remote_meta_dlist_t &dlist,
                                      const std::vector<void *> &direct_ptrs,
                                      nixlMemViewH &out) {
-    // Validated before anything is allocated, so a rejected prep leaves no
-    // entry to roll back.
     if (dlist.getType() != VRAM_SEG) {
         NIXL_ERROR << "nixlProxyMemViewRegistry::prepRemote: unsupported mem type "
                    << dlist.getType();
@@ -123,18 +100,13 @@ nixlProxyMemViewRegistry::prepRemote(const nixl_remote_meta_dlist_t &dlist,
     const std::lock_guard<std::mutex> lock(ctrl_mutex_);
 
     RegistryEntry *entry = nullptr;
-    const nixl_status_t status = createEntryLocked(direct_ptrs, entry);
+    const nixl_status_t status = createEntryLocked(dlist, direct_ptrs, entry);
     if (status != NIXL_SUCCESS) {
         return status;
     }
 
-    entry->remote = true;
-    entry->mem_type = dlist.getType();
-    fillDescs(dlist, entry->descs);
-    by_id_[entry->id - 1].store(entry, std::memory_order_release);
-
     out = entry->proxy_memview;
-    NIXL_DEBUG << "nixlProxyMemViewRegistry::prepRemote: proxy_id=" << entry->id
+    NIXL_DEBUG << "nixlProxyMemViewRegistry::prepRemote: host_view=" << entry
                << " descs=" << dlist.descCount() << " direct_ptrs=" << direct_ptrs.size();
     return NIXL_SUCCESS;
 }
@@ -143,40 +115,13 @@ nixl_status_t
 nixlProxyMemViewRegistry::unregister(nixlMemViewH proxy_memview) {
     const std::lock_guard<std::mutex> lock(ctrl_mutex_);
 
-    const auto it = handle_to_id_.find(proxy_memview);
-    if (it == handle_to_id_.end()) {
+    const auto it = views_.find(proxy_memview);
+    if (it == views_.end()) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    RegistryEntry *entry = owned_[it->second - 1].get();
-    handle_to_id_.erase(it);
-
-    // Retire first: a worker that already resolved this id still holds a valid
-    // entry, but no new submission can reach it.
-    by_id_[entry->id - 1].store(nullptr, std::memory_order_release);
-
-    // Then free the device allocation. Only the GPU ever reads it, and the
-    // caller is expected to have quiesced the GPU - the same contract
-    // ucp_device_mem_list_release() relies on for the direct path.
-    entry->proxy_memview_mem.reset();
-    entry->proxy_memview = nullptr;
-
-    NIXL_DEBUG << "nixlProxyMemViewRegistry::unregister: proxy_id=" << entry->id;
+    views_.erase(it);
     return NIXL_SUCCESS;
-}
-
-bool
-nixlProxyMemViewRegistry::resolve(nixlMemViewH proxy_memview, nixlMemViewH &backend_out) const {
-    const std::lock_guard<std::mutex> lock(ctrl_mutex_);
-
-    // Only live handles are in the map; unregister() erases them.
-    const auto it = handle_to_id_.find(proxy_memview);
-    if (it == handle_to_id_.end()) {
-        return false;
-    }
-
-    backend_out = owned_[it->second - 1]->backend_memview;
-    return true;
 }
 
 nixl_status_t
@@ -200,7 +145,7 @@ nixlProxyMemViewRegistry::prepareSubmission(const nixlProxySubmission &submissio
 
     const RegistryEntry *dst_entry = nullptr;
     const StoredDesc *dst_desc = nullptr;
-    nixl_status_t status = lookupDesc(submission.dst_proxy_memview_id,
+    nixl_status_t status = lookupDesc(submission.dst_view,
                                       submission.dst_index,
                                       submission.dst_offset,
                                       transfer_size,
@@ -217,20 +162,18 @@ nixlProxyMemViewRegistry::prepareSubmission(const nixlProxySubmission &submissio
     prepared.channel_id = submission.channel_id;
     prepared.flags = submission.flags;
     prepared.size = transfer_size;
-    prepared.value = submission.value;
-    prepared.remote_agent = dst_desc->remote_agent;
+    prepared.value = needs_source ? 0 : submission.operand;
     prepared.remote.mem_type = dst_entry->mem_type;
-    prepared.remote.desc = nixlMetaDesc(dst_desc->base_addr + submission.dst_offset,
-                                        transfer_size,
-                                        dst_desc->dev_id,
-                                        dst_desc->metadata);
+    prepared.remote.desc = dst_desc->desc;
+    prepared.remote.desc.addr += submission.dst_offset;
+    prepared.remote.desc.len = transfer_size;
 
     if (needs_source) {
         const RegistryEntry *src_entry = nullptr;
         const StoredDesc *src_desc = nullptr;
-        status = lookupDesc(submission.src_proxy_memview_id,
+        status = lookupDesc(submission.src_view,
                             submission.src_index,
-                            submission.src_offset,
+                            submission.operand,
                             transfer_size,
                             /*want_remote=*/false,
                             src_entry,
@@ -240,10 +183,9 @@ nixlProxyMemViewRegistry::prepareSubmission(const nixlProxySubmission &submissio
         }
 
         prepared.local.mem_type = src_entry->mem_type;
-        prepared.local.desc = nixlMetaDesc(src_desc->base_addr + submission.src_offset,
-                                           transfer_size,
-                                           src_desc->dev_id,
-                                           src_desc->metadata);
+        prepared.local.desc = src_desc->desc;
+        prepared.local.desc.addr += submission.operand;
+        prepared.local.desc.len = transfer_size;
     }
 
     prepared_submission = prepared;
@@ -251,7 +193,7 @@ nixlProxyMemViewRegistry::prepareSubmission(const nixlProxySubmission &submissio
 }
 
 nixl_status_t
-nixlProxyMemViewRegistry::lookupDesc(uint64_t proxy_memview_id,
+nixlProxyMemViewRegistry::lookupDesc(uint64_t host_view,
                                      size_t index,
                                      size_t offset,
                                      size_t size,
@@ -262,15 +204,15 @@ nixlProxyMemViewRegistry::lookupDesc(uint64_t proxy_memview_id,
     desc_out = nullptr;
 
     const char *const role = want_remote ? "dst" : "src";
-    const RegistryEntry *entry = entryForId(proxy_memview_id);
+    const auto *entry = reinterpret_cast<const RegistryEntry *>(static_cast<uintptr_t>(host_view));
     if (entry == nullptr) {
         NIXL_DEBUG << "nixlProxyMemViewRegistry::prepareSubmission: " << role
-                   << " not ready, proxy_id=" << proxy_memview_id;
+                   << " not ready, host_view=" << host_view;
         return NIXL_ERR_NOT_FOUND;
     }
     if (entry->remote != want_remote) {
         NIXL_DEBUG << "nixlProxyMemViewRegistry::prepareSubmission: " << role
-                   << " has the wrong role, proxy_id=" << proxy_memview_id;
+                   << " has the wrong role, host_view=" << host_view;
         return NIXL_ERR_INVALID_PARAM;
     }
     if (index >= entry->descs.size()) {
@@ -278,12 +220,7 @@ nixlProxyMemViewRegistry::lookupDesc(uint64_t proxy_memview_id,
     }
 
     const StoredDesc &desc = entry->descs[index];
-    if (!rangeFits(desc, offset, size)) {
-        return NIXL_ERR_INVALID_PARAM;
-    }
-    if (want_remote && (desc.remote_agent.empty() || desc.remote_agent == nixl_null_agent)) {
-        NIXL_DEBUG << "nixlProxyMemViewRegistry::prepareSubmission: dst remote agent invalid"
-                   << " proxy_id=" << proxy_memview_id;
+    if (!desc.usable || !rangeFits(desc.desc, offset, size)) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
@@ -293,7 +230,7 @@ nixlProxyMemViewRegistry::lookupDesc(uint64_t proxy_memview_id,
 }
 
 bool
-nixlProxyMemViewRegistry::rangeFits(const StoredDesc &desc, size_t offset, size_t size) {
+nixlProxyMemViewRegistry::rangeFits(const nixlMetaDesc &desc, size_t offset, size_t size) {
     return offset <= desc.len && size <= desc.len - offset;
 }
 
@@ -303,13 +240,9 @@ nixlProxyMemViewRegistry::fillDescs(const DlistT &dlist, std::vector<StoredDesc>
     out.clear();
     out.reserve(dlist.descCount());
     for (const auto &desc : dlist) {
-        StoredDesc stored;
-        stored.base_addr = desc.addr;
-        stored.len = desc.len;
-        stored.dev_id = desc.devId;
-        stored.metadata = desc.metadataP;
+        StoredDesc stored{desc};
         if constexpr (std::is_same_v<DlistT, nixl_remote_meta_dlist_t>) {
-            stored.remote_agent = desc.remoteAgent;
+            stored.usable = !desc.remoteAgent.empty() && desc.remoteAgent != nixl_null_agent;
         }
         out.push_back(std::move(stored));
     }
