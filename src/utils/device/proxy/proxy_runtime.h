@@ -71,22 +71,25 @@ struct alignas(64) nixlProxyChannelState {
     nixlDeviceAllocator *allocator_ = nullptr;
     size_t control_slot_index_ = 0;
     /** Host-side ring depth for the CPU worker; nixlProxyWorkRing itself is device-only. */
-    uint32_t         ring_depth_         = 0;
+    uint32_t ring_depth_ = 0;
     /** Mapped pinned host completion slot; worker writes host alias, GPU polls device alias. */
     nixlMappedHostMem completion_slot_mem_;
 
     nixlProxyChannelState() = default;
     ~nixlProxyChannelState() = default;
     nixlProxyChannelState(nixlProxyChannelState &&) noexcept = default;
-    nixlProxyChannelState &operator=(nixlProxyChannelState &&) noexcept = default;
+    nixlProxyChannelState &
+    operator=(nixlProxyChannelState &&) noexcept = default;
     nixlProxyChannelState(const nixlProxyChannelState &) = delete;
-    nixlProxyChannelState &operator=(const nixlProxyChannelState &) = delete;
+    nixlProxyChannelState &
+    operator=(const nixlProxyChannelState &) = delete;
 
     nixl_status_t
     allocate(nixlDeviceAllocator &allocator,
              uint32_t depth,
              nixlProxyControlBuffer *control_slots,
              size_t control_slot_index);
+
 
     /**
      * Put an allocated ring back to the state allocate() left it in - empty,
@@ -105,18 +108,9 @@ struct alignas(64) nixlProxyChannelState {
     [[nodiscard]] bool
     drained() const noexcept;
 
-    /**
-     * Hand every request still in flight back to the backend and forget it.
-     * Returns how many were released.
-     *
-     * This releases bookkeeping only - no transport can abort an operation the
-     * proxy has already posted (repo docs/issues/006 B6). A released transfer
-     * may still read its source buffer and land remotely until the transport
-     * reports the peer gone, so the memory behind one must stay mapped until
-     * the endpoint is torn down.
-     */
-    size_t
-    releaseInflightRequests(const nixlProxyBackendOps &backend_ops) noexcept;
+    /** All producer tickets must have reached terminal completion before reclamation. */
+    void
+    verifyDrained() const noexcept;
 
     nixl_status_t
     publishConsumerIdx(uint64_t value) noexcept;
@@ -141,106 +135,109 @@ struct alignas(64) nixlProxyChannelState {
 };
 
 class nixlProxyRuntime {
-    public:
-        ~nixlProxyRuntime();
+public:
+    ~nixlProxyRuntime();
 
-        nixlProxyRuntime(nixlProxyRuntime &&) = delete;
-        nixlProxyRuntime(const nixlProxyRuntime &) = delete;
-        nixlProxyRuntime& operator=(nixlProxyRuntime &&) = delete;
-        nixlProxyRuntime& operator=(const nixlProxyRuntime &) = delete;
+    nixlProxyRuntime(nixlProxyRuntime &&) = delete;
+    nixlProxyRuntime(const nixlProxyRuntime &) = delete;
+    nixlProxyRuntime &
+    operator=(nixlProxyRuntime &&) = delete;
+    nixlProxyRuntime &
+    operator=(const nixlProxyRuntime &) = delete;
 
-        /**
-         * Build a ready - but not yet running - runtime, or fail leaving `out`
-         * untouched. All device memory comes from `allocator`, which must
-         * outlive the runtime. startWorkers() is a separate, later call: the
-         * worker threads call back into the backend that owns the runtime, so
-         * the owner has to be fully constructed first.
-         */
-        [[nodiscard]] static nixl_status_t
-        create(nixlProxyBackendOps backend_ops,
-               const nixlProxyConfig &config,
-               std::unique_ptr<nixlProxyRuntime> &out,
-               nixlDeviceAllocator &allocator = nixlGetDeviceAllocator());
+    /**
+     * Build a ready - but not yet running - runtime, or fail leaving `out`
+     * untouched. All device memory comes from `allocator`, which must
+     * outlive the runtime. startWorkers() is a separate, later call: the
+     * worker threads call back into the backend that owns the runtime, so
+     * the owner has to be fully constructed first.
+     */
+    [[nodiscard]] static nixl_status_t
+    create(nixlProxyBackendOps backend_ops,
+           const nixlProxyConfig &config,
+           std::unique_ptr<nixlProxyRuntime> &out,
+           nixlDeviceAllocator &allocator = nixlGetDeviceAllocator());
 
-        nixl_status_t
-        loadRemoteConnInfo(const std::string &remote_name,
-                           const nixl_blob_t &conn_info);
+    nixl_status_t
+    loadRemoteConnInfo(const std::string &remote_name, const nixl_blob_t &conn_info);
 
-        nixl_status_t
-        remoteDisconnected(const std::string &remote_name);
+    nixl_status_t
+    remoteDisconnected(const std::string &remote_name);
 
-        [[nodiscard]] nixl_status_t
-        prepMemView(const nixl_meta_dlist_t &dlist,
-                    nixlMemViewH *proxy_memview);
 
-        /** Resolves the backend's direct pointers first, when it offers any. */
-        [[nodiscard]] nixl_status_t
-        prepMemView(const nixl_remote_meta_dlist_t &dlist,
-                    nixlMemViewH *proxy_memview);
+    [[nodiscard]] nixl_status_t
+    prepMemView(const nixl_meta_dlist_t &dlist, nixlMemViewH *proxy_memview);
 
-        [[nodiscard]] nixl_status_t
-        unregisterProxyMemView(nixlMemViewH proxy_memview);
+    /** Resolves the backend's direct pointers first, when it offers any. */
+    [[nodiscard]] nixl_status_t
+    prepMemView(const nixl_remote_meta_dlist_t &dlist, nixlMemViewH *proxy_memview);
 
-        [[nodiscard]] bool
-        resolveProxyMemView(nixlMemViewH proxy_memview,
-                            nixlMemViewH &backend_memview) const;
+    [[nodiscard]] nixl_status_t
+    unregisterProxyMemView(nixlMemViewH proxy_memview);
 
-        [[nodiscard]] nixl_status_t
-        startWorkers();
 
-        nixl_status_t
-        shutdown();
+    [[nodiscard]] nixl_status_t
+    startWorkers();
 
-        const nixlProxyMemViewRegistry &
-        memviewRegistry() const { return *memview_registry_; }
+    nixl_status_t
+    shutdown();
 
-        const nixlProxyChannelView *
-        deviceChannelViews() const {
-            return device_channel_views_.empty() ? nullptr : device_channel_views_.data();
-        }
+    const nixlProxyMemViewRegistry &
+    memviewRegistry() const {
+        return *memview_registry_;
+    }
 
-        nixlProxyDeviceContextData *
-        deviceContext() const { return device_context_mem_.as<nixlProxyDeviceContextData>(); }
+    const nixlProxyChannelView *
+    deviceChannelViews() const {
+        return device_channel_views_.empty() ? nullptr : device_channel_views_.data();
+    }
 
-    private:
-        /**
-         * Drive every ring to a terminal state and rearm it, so that memviews
-         * the records reference can be retired without dropping work. The
-         * workers do the ring-state changes; this only raises the request and
-         * waits for them, so nothing here touches a ring.
-         */
-        void
-        drainChannels() noexcept;
+    nixlProxyDeviceContextData *
+    deviceContext() const {
+        return device_context_mem_.as<nixlProxyDeviceContextData>();
+    }
 
-        nixlProxyRuntime(nixlProxyBackendOps backend_ops,
-                         const nixlProxyConfig &config,
-                         nixlDeviceAllocator &allocator) noexcept;
+private:
+    /**
+     * Drive every ring to a terminal state and rearm it, so that memviews
+     * the records reference can be retired without dropping work. The
+     * workers do the ring-state changes; this only raises the request and
+     * waits for them, so nothing here touches a ring.
+     */
+    void
+    drainChannels() noexcept;
 
-        /** Allocate rings, device context and workers; see create(). */
-        nixl_status_t
-        build();
 
-        void
-        joinWorkerThreads() noexcept;
+    nixlProxyRuntime(nixlProxyBackendOps backend_ops,
+                     const nixlProxyConfig &config,
+                     nixlDeviceAllocator &allocator) noexcept;
 
-        nixlDeviceAllocator &allocator_;
-        nixlProxyBackendOps backend_ops_;
-        nixlProxyConfig config_;
-        std::vector<nixlProxyChannelState> channels_;
-        nixlProxyControlBuffer control_slots_;
-        std::vector<nixlProxyChannelView> device_channel_views_;
-        nixlDeviceMem device_channel_views_mem_;
-        nixlDeviceMem device_context_mem_;
-        std::vector<std::unique_ptr<ProxyWorker>> workers_;
-        /** Built in build(), once the device context it stamps into memviews
-         *  exists; destroyed by shutdown(), which frees every memview with it. */
-        std::unique_ptr<nixlProxyMemViewRegistry> memview_registry_;
-        alignas(64) std::atomic<uint64_t> shutdown_state_{
-            static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN)};
-        /** Bumped once per drain; each worker acks it when it has applied it. */
-        alignas(64) std::atomic<uint64_t> drain_requested_{0};
-        uint64_t *shutdown_word_dev_ = nullptr;
-        bool workers_started_ = false;
+    /** Allocate rings, device context and workers; see create(). */
+    nixl_status_t
+    build();
+
+    void
+    joinWorkerThreads() noexcept;
+
+    nixlDeviceAllocator &allocator_;
+    nixlProxyBackendOps backend_ops_;
+    nixlProxyConfig config_;
+    mutable std::mutex control_mutex_;
+    std::vector<nixlProxyChannelState> channels_;
+    nixlProxyControlBuffer control_slots_;
+    std::vector<nixlProxyChannelView> device_channel_views_;
+    nixlDeviceMem device_channel_views_mem_;
+    nixlDeviceMem device_context_mem_;
+    std::vector<std::unique_ptr<ProxyWorker>> workers_;
+    /** Built in build(), once the device context it stamps into memviews
+     *  exists; destroyed by shutdown(), which frees every memview with it. */
+    std::unique_ptr<nixlProxyMemViewRegistry> memview_registry_;
+    alignas(64) std::atomic<uint64_t> shutdown_state_{
+        static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN)};
+    /** Bumped once per drain; each worker acks it when it has applied it. */
+    alignas(64) std::atomic<uint64_t> drain_requested_{0};
+    uint64_t *shutdown_word_dev_ = nullptr;
+    bool workers_started_ = false;
 };
 
 #endif // NIXL_SRC_UTILS_DEVICE_PROXY_PROXY_RUNTIME_H

@@ -20,15 +20,6 @@
 #include "nixl_log.h"
 #include <chrono>
 
-namespace {
-/**
- * How long a single drain waits for the backend to finish what a ring already
- * submitted. A healthy ring drains in microseconds; this only has to be short
- * enough that one wedged peer cannot stall a membership change.
- */
-constexpr std::chrono::milliseconds kProxyDrainTimeout{100};
-} // namespace
-
 ProxyWorker::ProxyWorker(const nixlProxyBackendOps *backend_ops,
                          const nixlProxyMemViewRegistry *proxy_memview_registry,
                          std::atomic<uint64_t> *shutdown_state,
@@ -108,9 +99,7 @@ ProxyWorker::submitOwnedChannels() {
 
 void
 ProxyWorker::runOnce() {
-    // Checked first so a drain observes the rings before this pass adds to
-    // them. A relaxed load against a word that only changes at a membership
-    // transition costs nothing on the steady-state path.
+    // Retirement is acknowledged only after quiescence and reset.
     if (drain_requested_ != nullptr) {
         const uint64_t requested = drain_requested_->load(std::memory_order_acquire);
         if (requested != drain_acked_.load(std::memory_order_relaxed)) {
@@ -135,38 +124,22 @@ ProxyWorker::ownedChannelsDrained() {
 
 void
 ProxyWorker::drainOwnedChannels() {
-    // Nothing more than the ordinary pass, repeated until there is nothing
-    // left. Stepping every ring each time is what keeps a peer whose requests
-    // never terminate from starving the rings behind it, and one deadline for
-    // the whole sweep bounds a drain to a single timeout however many rings
-    // this worker owns. The GPU is quiesced by the caller, so submit_idx_ only
-    // moves as this worker picks up records that were already published.
-    const auto deadline = std::chrono::steady_clock::now() + kProxyDrainTimeout;
     while (!ownedChannelsDrained()) {
         submitOwnedChannels();
         driveBackendProgress();
         publishOwnedChannels();
-        if (std::chrono::steady_clock::now() >= deadline) {
-            break;
-        }
     }
 
     forEachOwnedChannel([this](nixlProxyChannelState &channel, uint32_t channel_id, uint32_t peer) {
         if (!channel.allocated()) {
             return;
         }
-        if (!channel.drained()) {
-            // A dead peer under err_mode=none may never complete. Give the
-            // requests back and say so, instead of dropping the work silently
-            // the way a retire used to.
-            const size_t released = channel.releaseInflightRequests(*backend_ops_);
-            NIXL_WARN << "ProxyWorker::drainOwnedChannels: channel " << channel_id << " peer "
-                      << peer << " did not drain (timed out); released " << released
-                      << " in-flight request(s)";
+        channel.verifyDrained();
+        if (backend_ops_->quiesce(channel_id, peer) != NIXL_SUCCESS) {
+            NIXL_FATAL << "Failed to quiesce proxy backend";
         }
         if (channel.rearm() != NIXL_SUCCESS) {
-            NIXL_ERROR << "ProxyWorker::drainOwnedChannels: failed to rearm channel " << channel_id
-                       << " peer " << peer;
+            NIXL_FATAL << "Failed to reset drained proxy ring";
         }
     });
 }
@@ -223,7 +196,7 @@ ProxyWorker::submitToBackend(nixlProxyChannelState &channel,
                << " channel=" << submission.channel_id << " local_addr=0x" << std::hex
                << prepared_submission.local.desc.addr << " remote_addr=0x"
                << prepared_submission.remote.desc.addr << std::dec << " size=" << submission.size
-               << " remote_agent='" << prepared_submission.remote_agent << "'";
+               << " peer=" << peer;
 
     status = backend_ops_->submit(prepared_submission, inflight.backend_request);
     inflight.status = status;
@@ -278,9 +251,8 @@ ProxyWorker::publishCompletions(nixlProxyChannelState &channel) {
                 &channel.completionSlotHost()->completed_idx, front.op_idx, __ATOMIC_RELEASE);
         }
         if (channel.publishConsumerIdx(consumer_idx + 1) != NIXL_SUCCESS) {
-            NIXL_ERROR << "ProxyWorker::publishCompletions: failed to publish CI"
+            NIXL_FATAL << "ProxyWorker::publishCompletions: failed to publish CI"
                        << " consumer_idx=" << consumer_idx + 1;
-            break;
         }
         front = nixlProxyRequestState{};
     }
