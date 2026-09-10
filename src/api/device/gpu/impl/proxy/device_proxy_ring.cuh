@@ -28,16 +28,16 @@ namespace nixl::gpu::impl::proxy {
 // Overlay struct written into xferStatusH::storage by enqueue()
 // and read back by pollXferStatus().  Must fit within the 64-byte opaque blob.
 struct ProxyXferStatus {
-    nixlProxyCompletionSlot *slot;  // device pointer to the channel's nixlProxyCompletionSlot
-    uint64_t        op_idx;
+    nixlProxyCompletionSlot *slot; // device pointer to the channel's nixlProxyCompletionSlot
+    uint64_t op_idx;
 };
 
 static_assert(sizeof(ProxyXferStatus) <= xfer_status_payload_size,
               "ProxyXferStatus must fit in the transfer-status payload");
 
-__device__ __forceinline__ uint32_t
-proxyMemViewIdFromHandle(nixlMemViewH mvh) {
-    return static_cast<const nixlProxyDeviceMemView *>(mvh)->proxy_memview_id;
+__device__ __forceinline__ uint64_t
+proxyHostViewFromHandle(nixlMemViewH mvh) {
+    return static_cast<const nixlProxyDeviceMemView *>(mvh)->host_view;
 }
 
 struct ProxyDeviceContext;
@@ -126,8 +126,7 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
         }
         nixlProxyWorkRing *ring = channel_view.work_ring;
 
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_device> producer_idx(
-            *ring->producer_idx);
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_device> producer_idx(*ring->producer_idx);
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> cons(*ring->consumer_idx);
 
         // Atomically claim a unique slot in the ring.
@@ -177,14 +176,12 @@ struct ProxyDeviceContext : nixlProxyDeviceContextData {
     //                              latched the channel
     __device__ inline static nixl_status_t
     pollXferStatus(const xferStatusH &xfer_status) {
-        const ProxyXferStatus *pxs =
-            reinterpret_cast<const ProxyXferStatus *>(xfer_status.storage);
+        const ProxyXferStatus *pxs = reinterpret_cast<const ProxyXferStatus *>(xfer_status.storage);
         if (pxs->slot == nullptr) {
             return NIXL_ERR_BACKEND;
         }
 
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> comp_idx(
-            pxs->slot->completed_idx);
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> comp_idx(pxs->slot->completed_idx);
 
         const uint64_t completed_idx = comp_idx.load(cuda::memory_order_acquire);
         if (completed_idx > pxs->op_idx) {
