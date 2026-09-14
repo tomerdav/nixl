@@ -48,7 +48,6 @@ ProxyWorker::~ProxyWorker() {
 void
 ProxyWorker::start() {
     thread_ = std::thread([this]() {
-        NIXL_INFO << "ProxyWorker thread " << worker_index_ << " started";
         while (shutdown_state_->load(std::memory_order_acquire) ==
                static_cast<uint64_t>(nixl_proxy_control_state_t::RUNNING)) {
             runOnce();
@@ -56,7 +55,6 @@ ProxyWorker::start() {
                 std::this_thread::sleep_for(std::chrono::microseconds(pthr_delay_us_));
             }
         }
-        NIXL_INFO << "ProxyWorker thread " << worker_index_ << " exiting";
     });
 }
 

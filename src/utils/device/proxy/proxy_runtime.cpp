@@ -30,8 +30,6 @@ nixlProxyChannelState::allocate(nixlDeviceAllocator &allocator,
                                 uint32_t depth,
                                 nixlProxyControlBuffer *control_slots,
                                 size_t control_slot_index) {
-    NIXL_INFO << "nixlProxyChannelState::allocate: depth=" << depth
-              << " control_slot_index=" << control_slot_index;
     if (depth == 0 || control_slots == nullptr ||
         control_slots->devicePtr(control_slot_index) == nullptr) {
         return NIXL_ERR_INVALID_PARAM;
@@ -76,15 +74,8 @@ nixlProxyChannelState::allocate(nixlDeviceAllocator &allocator,
     device_view = nixlProxyChannelView{work_ring_mem_.as<nixlProxyWorkRing>(),
                                        completion_slot_mem_.asDev<nixlProxyCompletionSlot>()};
 
-    NIXL_INFO << "nixlProxyChannelState::allocate: ready"
-              << " work_ring(dev)=" << work_ring_mem_.get() << " records=" << recordsHost()
-              << " records(dev)=" << records_mem_.devPtr()
-              << " producer_idx(dev)=" << producer_idx_mem_.get()
-              << " consumer_idx(shadow)=" << consumer_idx_shadow_
-              << " consumer_idx(dev)=" << consumer_idx_dev_
-              << " consumer_idx_cache(dev)=" << consumer_idx_cache_mem_.get()
-              << " completion_slot(host)=" << completionSlotHost()
-              << " completion_slot(dev)=" << completion_slot_mem_.devPtr();
+    NIXL_DEBUG << "Proxy ring: depth=" << depth << " control_slot=" << control_slot_index
+              << " records(dev)=" << records_mem_.devPtr();
     return NIXL_SUCCESS;
 }
 
@@ -283,9 +274,6 @@ nixlProxyRuntime::build() {
 
     workers_.reserve(worker_count);
     for (uint32_t worker_idx = 0; worker_idx < worker_count; worker_idx++) {
-        NIXL_INFO << "ProxyRuntime::build: worker " << worker_idx
-                  << " owns channel(s) where channel_id % " << worker_count << " == " << worker_idx
-                  << "; handles all dest rings of those channels";
         workers_.push_back(std::make_unique<ProxyWorker>(&backend_ops_,
                                                          memview_registry_.get(),
                                                          &shutdown_state_,
@@ -298,9 +286,6 @@ nixlProxyRuntime::build() {
                                                          &drain_requested_));
     }
 
-    NIXL_INFO << "ProxyRuntime::build: complete - " << max_peers << " peers, " << channel_count
-              << " channels (rings per dest), " << worker_count
-              << " workers, device_context(dev)=" << deviceContext();
     return NIXL_SUCCESS;
 }
 
@@ -417,7 +402,6 @@ nixlProxyRuntime::startWorkers() {
     }
     workers_started_ = true;
 
-    NIXL_INFO << "ProxyRuntime::startWorkers: all threads launched";
     return NIXL_SUCCESS;
 }
 
