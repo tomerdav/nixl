@@ -1,5 +1,8 @@
 # NIXL EP: Expert-Parallel Communication Example
 
+For the standalone ownership-v2 cluster validation branch, see
+[CLUSTER_VALIDATION.md](CLUSTER_VALIDATION.md).
+
 ## Overview
 
 NIXL EP is a complete example implementation of expert-parallel communication for Mixture of Experts (MoE) models built on top of [NIXL](https://github.com/ai-dynamo/nixl)'s device API. It provides elastic scaling capabilities, enabling dynamic addition and removal of processes (ranks) during runtime without disrupting existing connections, and leverages NIXL's RDMA and NVLink support for optimal performance.
