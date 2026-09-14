@@ -51,33 +51,19 @@ struct nixlProxyConfig {
     /** Work-ring depth per (channel, peer) slot; power of two. */
     uint32_t ring_depth = kDefaultProxyRingDepth;
 
-    /** Rings the topology needs: one per (channel, peer) slot. */
     [[nodiscard]] size_t
     ringCount() const noexcept {
         return static_cast<size_t>(channel_count) * max_peers;
     }
 
-    /**
-     * Proxy threads actually started. Channels are striped across threads, so
-     * a thread beyond channel_count would own nothing.
-     */
+    /** Threads beyond channel_count would own no channels. */
     [[nodiscard]] uint32_t
     effectiveThreadCount() const noexcept {
         return std::min(thread_count, channel_count);
     }
 };
 
-/**
- * Parse and strictly validate the proxy backend params.
- *
- * Fails (NIXL_ERR_INVALID_PARAM) on malformed values, zero counts, a ring
- * depth that is not a power of two, unknown proxy_*-prefixed keys, or proxy_*
- * keys given without device_proxy=true.
- * Fails (NIXL_ERR_NOT_ALLOWED) when device_proxy=true is combined with the
- * shared progress thread (enableProgTh).
- * With device_proxy absent/false and no other proxy keys, succeeds with
- * config.enabled == false.
- */
+/** Parse proxy parameters; reject invalid tuning and conflicting backend progress. */
 [[nodiscard]] nixl_status_t
 nixlParseProxyConfig(const nixlBackendInitParams &init_params, nixlProxyConfig &config) noexcept;
 

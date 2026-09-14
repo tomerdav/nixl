@@ -60,14 +60,7 @@ struct nixlBackendProxyRequest {
     }
 };
 
-/**
- * The transport half of the proxy, injected into nixlProxyRuntime::create().
- *
- * The runtime owns rings, workers and the memview registry; everything that
- * touches a network stack lives behind these callbacks. std::function is
- * deliberate: this is an in-process boundary between the runtime and the
- * backend engine that owns it, not an ABI boundary.
- */
+/** Backend callbacks used by the owning proxy runtime; not a public ABI. */
 struct nixlProxyBackendOps {
     /** Required; create() rejects a struct with any of these unset. */
     std::function<nixl_status_t(const nixlProxyConfig &)> init;
@@ -78,16 +71,10 @@ struct nixlProxyBackendOps {
     std::function<nixl_status_t(uint32_t channel, uint32_t peer)> progress;
     std::function<nixl_status_t()> shutdown;
 
-    /**
-     * Optional; unset means the backend does not care about the event. When
-     * set, every error return is a real error and propagates to the caller.
-     */
-    std::function<nixl_status_t(const std::string &, const nixl_blob_t &)> on_remote_loaded;
-    std::function<nixl_status_t(const std::string &)> on_remote_disconnected;
+    /** Optional direct-access pointers, indexed by descriptor. */
     std::function<nixl_status_t(const nixl_remote_meta_dlist_t &, std::vector<void *> &)>
         resolve_direct_ptrs;
 
-    /** All required callbacks present. */
     [[nodiscard]] bool
     complete() const noexcept {
         return init && submit && check_completion && release_request && progress && shutdown;
