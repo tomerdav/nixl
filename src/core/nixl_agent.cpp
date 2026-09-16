@@ -330,6 +330,7 @@ nixlAgent::createBackend(const nixl_backend_t &type,
 
     // First, try to load the backend as a plugin
     auto& plugin_manager = nixlPluginManager::getInstance();
+    init_params.utilities = &plugin_manager;
     auto plugin_handle = plugin_manager.loadBackendPlugin(type);
 
     if (!plugin_handle) {

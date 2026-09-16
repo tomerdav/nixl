@@ -369,13 +369,12 @@ if wheel_variant != ''
     cuda_wheel_dir = 'nixl_' + wheel_variant
 endif
 
-# AMD ROCm/HIP support for the libfabric plugin (mutually exclusive with CUDA;
-# default off). ROCm is requested by setting -Drocm_path=<prefix>; if rocm_path
+# AMD ROCm/HIP support for GPU-enabled components (default off). ROCm is
+# requested by setting -Drocm_path=<prefix>; if rocm_path
 # is empty, ROCm support is not requested (there is no default path). Defined
 # here in the root meson.build -- ahead of subdir('src') and subdir('test') --
-# so every libfabric subdir (src/utils, src/plugins, test/unit/utils) consumes a
-# single rocm_dep and hipify_src, with no ordering dependency between them. The
-# plugin's CUDA sources are translated to HIP at build time via hipify-perl;
+# so every ROCm-enabled subdir consumes a single rocm_dep and hipify_src, with
+# no ordering dependency between them. CUDA sources are translated to HIP at build time via hipify-perl;
 # rocm_dep supplies the HIP headers and runtime those translated sources compile
 # and link against. __HIP_PLATFORM_AMD__ lets the HIP headers work under a
 # non-hipcc host compiler. Kept separate from cuda_dep.
@@ -624,6 +623,9 @@ if get_option('install_headers')
   install_headers('src/utils/serdes/serdes.h', install_dir: prefix_inc + '/utils/serdes')
   install_headers('src/utils/common/nixl_time.h', install_dir: prefix_inc + '/utils/common')
   install_headers('src/utils/common/nixl_log.h', install_dir: prefix_inc + '/utils/common')
+  install_headers('src/utils/device/device_allocator.h', install_dir: prefix_inc + '/utils/device')
+  install_headers('src/utils/device/device_allocator_plugin.h', install_dir: prefix_inc + '/utils/device')
+  install_headers('src/utils/device/utility_services.h', install_dir: prefix_inc + '/utils/device')
   install_headers('src/api/cpp/backend/backend_engine.h', install_dir: prefix_inc + '/backend')
   install_headers('src/api/cpp/backend/backend_aux.h', install_dir: prefix_inc + '/backend')
   install_headers('src/api/cpp/backend/backend_plugin.h', install_dir: prefix_inc + '/backend')

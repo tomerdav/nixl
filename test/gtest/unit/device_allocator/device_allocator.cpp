@@ -18,10 +18,21 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <thread>
 #include <vector>
 
 #include "device/device_allocator.h"
 #include "gpu_utils.h"
+#include "plugin_manager.h"
+
+class nixlPluginManagerTestPeer {
+public:
+    static std::shared_ptr<const nixlDeviceAllocatorPluginHandle>
+    loadDeviceAllocatorPlugin(const std::string &path, nixlDeviceRuntime runtime) {
+        return nixlPluginManager::loadDeviceAllocatorPluginFromPath(path, runtime);
+    }
+};
 
 namespace gtest {
 namespace device_allocator {
@@ -53,13 +64,71 @@ namespace device_allocator {
     }
 
     TEST(deviceAllocatorHost, AccessorIsStableAndFreeNullIsSafe) {
-        nixlDeviceAllocator &allocator = nixlGetDeviceAllocator();
-        EXPECT_EQ(&allocator, &nixlGetDeviceAllocator());
+        auto &services = nixlPluginManager::getInstance();
+        nixlDeviceAllocator &allocator = services.deviceAllocator();
+        EXPECT_EQ(&allocator, &services.deviceAllocator());
         allocator.freeDeviceMem(nullptr);
     }
 
+    TEST(deviceAllocatorHost, SelectsProviderFromHardwareInventory) {
+        EXPECT_EQ(nixlPluginManager::deviceAllocatorProbeOrder(1, 0),
+                  std::vector<nixlDeviceRuntime>{nixlDeviceRuntime::CUDA});
+        EXPECT_EQ(nixlPluginManager::deviceAllocatorProbeOrder(0, 1),
+                  std::vector<nixlDeviceRuntime>{nixlDeviceRuntime::HIP});
+        EXPECT_EQ(nixlPluginManager::deviceAllocatorProbeOrder(1, 1),
+                  std::vector<nixlDeviceRuntime>{nixlDeviceRuntime::CUDA});
+        EXPECT_EQ(
+            nixlPluginManager::deviceAllocatorProbeOrder(0, 0),
+            (std::vector<nixlDeviceRuntime>{nixlDeviceRuntime::CUDA, nixlDeviceRuntime::HIP}));
+    }
+
+    TEST(deviceAllocatorHost, AccessorIsThreadSafe) {
+        constexpr size_t kThreads = 8;
+        std::array<nixlDeviceAllocator *, kThreads> allocators{};
+        std::array<std::thread, kThreads> threads;
+        for (size_t i = 0; i < kThreads; ++i) {
+            threads[i] = std::thread([i, &allocators]() {
+                allocators[i] = &nixlPluginManager::getInstance().deviceAllocator();
+            });
+        }
+        for (auto &thread : threads) {
+            thread.join();
+        }
+        EXPECT_TRUE(std::all_of(allocators.begin(), allocators.end(), [&](const auto *allocator) {
+            return allocator == allocators.front();
+        }));
+    }
+
+    TEST(deviceAllocatorHost, UnsupportedAllocatorPreservesNotSupported) {
+        auto &allocator = nixlGetUnsupportedDeviceAllocator();
+        nixlDeviceMem device_mem;
+        nixlMappedHostMem mapped_mem;
+        EXPECT_EQ(allocator.allocDeviceMem(kSize, device_mem), NIXL_ERR_NOT_SUPPORTED);
+        EXPECT_EQ(allocator.allocMappedHostMem(kSize, mapped_mem), NIXL_ERR_NOT_SUPPORTED);
+        EXPECT_FALSE(device_mem);
+        EXPECT_FALSE(mapped_mem);
+    }
+
+    TEST(deviceAllocatorHost, ValidatesProviderBeforeUsingIt) {
+        EXPECT_NE(nixlPluginManagerTestPeer::loadDeviceAllocatorPlugin(MOCK_DEVICE_ALLOCATOR_VALID,
+                                                                       nixlDeviceRuntime::CUDA),
+                  nullptr);
+        EXPECT_EQ(nixlPluginManagerTestPeer::loadDeviceAllocatorPlugin(
+                      "/missing/device/allocator/plugin.so", nixlDeviceRuntime::CUDA),
+                  nullptr);
+        EXPECT_EQ(nixlPluginManagerTestPeer::loadDeviceAllocatorPlugin(
+                      MOCK_DEVICE_ALLOCATOR_WRONG_ABI, nixlDeviceRuntime::CUDA),
+                  nullptr);
+        EXPECT_EQ(nixlPluginManagerTestPeer::loadDeviceAllocatorPlugin(
+                      MOCK_DEVICE_ALLOCATOR_WRONG_RUNTIME, nixlDeviceRuntime::CUDA),
+                  nullptr);
+        EXPECT_EQ(nixlPluginManagerTestPeer::loadDeviceAllocatorPlugin(
+                      MOCK_DEVICE_ALLOCATOR_FAILED_PROBE, nixlDeviceRuntime::CUDA),
+                  nullptr);
+    }
+
     TEST(deviceAllocatorHost, ZeroSizeAllocationsLeaveOutputsEmpty) {
-        nixlDeviceAllocator &allocator = nixlGetDeviceAllocator();
+        nixlDeviceAllocator &allocator = nixlPluginManager::getInstance().deviceAllocator();
         nixlDeviceMem device_mem;
         EXPECT_NE(allocator.allocDeviceMem(0, device_mem), NIXL_SUCCESS);
         EXPECT_FALSE(device_mem);
@@ -81,7 +150,7 @@ namespace device_allocator {
                 GTEST_SKIP() << "No GPU is available.";
             }
             gpuSetDevice(0, "Selecting GPU 0");
-            allocator_ = &nixlGetDeviceAllocator();
+            allocator_ = &nixlPluginManager::getInstance().deviceAllocator();
             int device = 0;
             const nixl_status_t status = allocator_->getActiveDevice(device);
             if (status == NIXL_ERR_NOT_SUPPORTED) {

@@ -27,6 +27,8 @@
 #include <mutex>
 
 #include "backend/backend_plugin.h"
+#include "device/device_allocator_plugin.h"
+#include "device/utility_services.h"
 #include "nixl_types.h"
 #include "telemetry/telemetry_plugin.h"
 #include "tracing/trace_plugin.h"
@@ -34,6 +36,7 @@
 // Forward declarations
 class nixlBackendEngine;
 struct nixlBackendInitParams;
+class nixlPluginManagerTestPeer;
 
 class nixlPluginHandle {
 public:
@@ -117,10 +120,34 @@ private:
     nixlTracePlugin *plugin_;
 };
 
+class nixlDeviceAllocatorPluginHandle : public nixlPluginHandle {
+public:
+    nixlDeviceAllocatorPluginHandle(void *handle, nixlDeviceAllocatorPluginV1 *plugin);
+    ~nixlDeviceAllocatorPluginHandle();
+
+    [[nodiscard]] nixlDeviceAllocator *
+    getAllocator() const noexcept;
+    [[nodiscard]] nixlDeviceRuntime
+    getRuntime() const noexcept;
+    const char *
+    getName() const override;
+    const char *
+    getVersion() const override;
+
+private:
+    friend class nixlPluginManager;
+
+    [[nodiscard]] bool
+    initializeAllocator() const noexcept;
+
+    nixlDeviceAllocatorPluginV1 *plugin_;
+    mutable nixlDeviceAllocator *allocator_ = nullptr;
+};
+
 typedef std::shared_ptr<const nixlPluginHandle> (
     *nixlPluginLoaderFunc)(void *handle, const std::string &plugin_path);
 
-class nixlPluginManager {
+class nixlPluginManager : public nixlUtilityServices {
 public:
     // Singleton instance accessor
     static nixlPluginManager& getInstance();
@@ -184,12 +211,23 @@ public:
     const std::vector<nixlTelemetryStaticPluginInfo> &
     getTelemetryStaticPlugins();
 
+    [[nodiscard]] nixlDeviceAllocator &
+    deviceAllocator() noexcept override;
+
+    [[nodiscard]] static std::vector<nixlDeviceRuntime>
+    deviceAllocatorProbeOrder(unsigned num_nvidia_gpus, unsigned num_amd_gpus);
+
 private:
+    friend class nixlPluginManagerTestPeer;
+
     std::map<nixl_backend_t, std::shared_ptr<const nixlBackendPluginHandle>>
         loaded_backend_plugins_;
     std::map<nixl_telemetry_plugin_t, std::shared_ptr<const nixlTelemetryPluginHandle>>
         loaded_telemetry_plugins_;
     std::map<std::string, std::shared_ptr<const nixlTracePluginHandle>> loaded_trace_plugins_;
+    std::map<nixlDeviceRuntime, std::vector<std::string>> device_allocator_plugin_paths_;
+    std::shared_ptr<const nixlDeviceAllocatorPluginHandle> device_allocator_handle_;
+    nixlDeviceAllocator *selected_device_allocator_ = nullptr;
     // Plugins discovered on disk but not yet dlopen'd
     std::set<nixl_backend_t> discovered_backend_plugins_;
     // Explicit paths from the plugin list file (name -> .so path)
@@ -223,6 +261,15 @@ private:
 
     void
     discoverTracePlugin(const std::string &filename);
+
+    void
+    discoverDeviceAllocatorPlugin(const std::filesystem::path &path);
+
+    [[nodiscard]] std::shared_ptr<const nixlDeviceAllocatorPluginHandle>
+    loadDeviceAllocatorPlugin(nixlDeviceRuntime runtime) const;
+
+    [[nodiscard]] static std::shared_ptr<const nixlDeviceAllocatorPluginHandle>
+    loadDeviceAllocatorPluginFromPath(const std::string &path, nixlDeviceRuntime runtime);
 
     [[nodiscard]] static std::shared_ptr<const nixlPluginHandle>
     loadPluginFromPath(const std::string &plugin_path,

@@ -25,13 +25,13 @@
 class nixlDeviceMem;
 class nixlMappedHostMem;
 
+// This can be unified with the other NIXL export macros in a later PR.
 #define NIXL_DEVICE_ALLOCATOR_EXPORT __attribute__((visibility("default")))
 
 /**
  * Device memory-ops interface. All host-side interaction with the GPU memory
  * runtime goes through this class so that no other host code needs a
- * cuda_runtime.h include. CUDA is the current platform implementation; HIP
- * can provide another. Allocations are returned as owning RAII handles, while
+ * CUDA or HIP runtime header. Allocations are returned as owning RAII handles, while
  * raw alloc/free remain protected implementation hooks. The class is not
  * internally synchronized. Transfers are issued on the default stream and are
  * ordered there, but not all are complete on return; synchronize() is the
@@ -311,8 +311,8 @@ nixlDeviceAllocator::allocMappedHostMem(size_t size, nixlMappedHostMem &out) noe
     return NIXL_SUCCESS;
 }
 
-/** Process-wide allocator for the device runtime available to this process. */
-[[nodiscard]] nixlDeviceAllocator &
-nixlGetDeviceAllocator() noexcept;
+/** Fallback used when no supported device runtime is available. */
+[[nodiscard]] NIXL_DEVICE_ALLOCATOR_EXPORT nixlDeviceAllocator &
+nixlGetUnsupportedDeviceAllocator() noexcept;
 
 #endif // NIXL_SRC_UTILS_DEVICE_DEVICE_ALLOCATOR_H

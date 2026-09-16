@@ -18,6 +18,7 @@
 #include "plugin_manager.h"
 #include "nixl.h"
 #include "common/configuration.h"
+#include "common/hw_info.h"
 #include "common/nixl_log.h"
 #include <dlfcn.h>
 #include <exception>
@@ -31,6 +32,7 @@
 const std::string backendPluginPrefix = "libplugin_";
 const std::string telemetryPluginPrefix = "libtelemetry_exporter_";
 const std::string tracePluginPrefix = "libtrace_backend_";
+const std::string deviceAllocatorPluginPrefix = "libutility_device_allocator_";
 const std::string kPluginSuffix = ".so";
 const std::string kUcxPluginName = "UCX";
 const std::string kUcxDeepBindVar = "NIXL_UCX_DEEPBIND";
@@ -272,6 +274,87 @@ traceLoader(void *handle, const std::string &plugin_path) {
 }
 } // namespace
 
+nixlDeviceAllocatorPluginHandle::nixlDeviceAllocatorPluginHandle(
+    void *handle,
+    nixlDeviceAllocatorPluginV1 *plugin)
+    : nixlPluginHandle(handle),
+      plugin_(plugin) {}
+
+nixlDeviceAllocatorPluginHandle::~nixlDeviceAllocatorPluginHandle() {
+    if (handle_) {
+        dlclose(handle_);
+        handle_ = nullptr;
+        plugin_ = nullptr;
+    }
+}
+
+nixlDeviceAllocator *
+nixlDeviceAllocatorPluginHandle::getAllocator() const noexcept {
+    return allocator_;
+}
+
+bool
+nixlDeviceAllocatorPluginHandle::initializeAllocator() const noexcept {
+    allocator_ = plugin_->getAllocator();
+    return allocator_ != nullptr;
+}
+
+nixlDeviceRuntime
+nixlDeviceAllocatorPluginHandle::getRuntime() const noexcept {
+    return plugin_->runtime;
+}
+
+const char *
+nixlDeviceAllocatorPluginHandle::getName() const {
+    return plugin_->name;
+}
+
+const char *
+nixlDeviceAllocatorPluginHandle::getVersion() const {
+    return plugin_->version;
+}
+
+namespace {
+const char *
+deviceRuntimeName(nixlDeviceRuntime runtime) {
+    return runtime == nixlDeviceRuntime::CUDA ? "CUDA" : "HIP";
+}
+
+std::shared_ptr<const nixlPluginHandle>
+deviceAllocatorLoader(void *handle, const std::string &plugin_path) {
+    dlerror();
+    auto init = reinterpret_cast<nixlDeviceAllocatorPluginInit>(
+        dlsym(handle, "nixl_device_allocator_plugin_init"));
+    if (!init) {
+        NIXL_ERROR << "Failed to find nixl_device_allocator_plugin_init in " << plugin_path << ": "
+                   << dlerror();
+        dlclose(handle);
+        return nullptr;
+    }
+
+    nixlDeviceAllocatorPluginV1 *plugin = init();
+    if (!plugin) {
+        NIXL_ERROR << "Device allocator plugin initialization failed for " << plugin_path;
+        dlclose(handle);
+        return nullptr;
+    }
+    if (plugin->apiVersion != NIXL_DEVICE_ALLOCATOR_PLUGIN_API_VERSION) {
+        NIXL_ERROR << "Device allocator plugin API version mismatch for " << plugin_path
+                   << ": expected " << NIXL_DEVICE_ALLOCATOR_PLUGIN_API_VERSION << ", got "
+                   << plugin->apiVersion;
+        dlclose(handle);
+        return nullptr;
+    }
+    if (!plugin->name || !plugin->version || !plugin->getAllocator) {
+        NIXL_ERROR << "Invalid device allocator plugin descriptor in " << plugin_path;
+        dlclose(handle);
+        return nullptr;
+    }
+
+    return std::make_shared<const nixlDeviceAllocatorPluginHandle>(handle, plugin);
+}
+} // namespace
+
 std::map<nixl_backend_t, std::string>
 loadPluginList(const std::string &filename) {
     std::map<nixl_backend_t, std::string> plugins;
@@ -365,6 +448,15 @@ nixlPluginManager::discoverPluginsFromList(const std::string &filename) {
     for (const auto& pair : plugins) {
         const std::string& name = pair.first;
         const std::string& path = pair.second;
+
+        if (name == "UTILITY_DEVICE_ALLOCATOR_CUDA") {
+            device_allocator_plugin_paths_[nixlDeviceRuntime::CUDA].push_back(path);
+            continue;
+        }
+        if (name == "UTILITY_DEVICE_ALLOCATOR_HIP") {
+            device_allocator_plugin_paths_[nixlDeviceRuntime::HIP].push_back(path);
+            continue;
+        }
 
         if (loaded_backend_plugins_.find(name) == loaded_backend_plugins_.end()) {
             discovered_backend_plugins_.insert(name);
@@ -642,6 +734,27 @@ nixlPluginManager::discoverTracePlugin(const std::string &filename) {
 }
 
 void
+nixlPluginManager::discoverDeviceAllocatorPlugin(const std::filesystem::path &path) {
+    const std::string filename = path.filename().string();
+    nixlDeviceRuntime runtime;
+    if (filename == deviceAllocatorPluginPrefix + "cuda" + kPluginSuffix) {
+        runtime = nixlDeviceRuntime::CUDA;
+    } else if (filename == deviceAllocatorPluginPrefix + "hip" + kPluginSuffix) {
+        runtime = nixlDeviceRuntime::HIP;
+    } else {
+        return;
+    }
+
+    const std::lock_guard lock(mutex_);
+    auto &paths = device_allocator_plugin_paths_[runtime];
+    const std::string plugin_path = path.string();
+    if (std::find(paths.begin(), paths.end(), plugin_path) == paths.end()) {
+        paths.push_back(plugin_path);
+        NIXL_INFO << "Discovered device allocator plugin: " << plugin_path;
+    }
+}
+
+void
 nixlPluginManager::discoverPluginsFromDir(const std::filesystem::path &dirpath) {
     std::error_code ec;
     std::filesystem::directory_iterator dir_iter(dirpath, ec);
@@ -655,7 +768,89 @@ nixlPluginManager::discoverPluginsFromDir(const std::filesystem::path &dirpath) 
         discoverBackendPlugin(filename);
         discoverTelemetryPlugin(filename);
         discoverTracePlugin(filename);
+        discoverDeviceAllocatorPlugin(entry.path());
     }
+}
+
+std::vector<nixlDeviceRuntime>
+nixlPluginManager::deviceAllocatorProbeOrder(unsigned num_nvidia_gpus, unsigned num_amd_gpus) {
+    if (num_nvidia_gpus != 0) {
+        return {nixlDeviceRuntime::CUDA};
+    }
+    if (num_amd_gpus != 0) {
+        return {nixlDeviceRuntime::HIP};
+    }
+    return {nixlDeviceRuntime::CUDA, nixlDeviceRuntime::HIP};
+}
+
+std::shared_ptr<const nixlDeviceAllocatorPluginHandle>
+nixlPluginManager::loadDeviceAllocatorPluginFromPath(const std::string &path,
+                                                     nixlDeviceRuntime runtime) {
+    if (path.empty() || !std::filesystem::exists(path)) {
+        return nullptr;
+    }
+
+    auto plugin = std::dynamic_pointer_cast<const nixlDeviceAllocatorPluginHandle>(
+        loadPluginFromPath(path, deviceAllocatorLoader));
+    if (!plugin) {
+        return nullptr;
+    }
+    if (plugin->getRuntime() != runtime) {
+        NIXL_ERROR << "Device allocator plugin runtime mismatch in " << path;
+        return nullptr;
+    }
+    if (!plugin->initializeAllocator()) {
+        return nullptr;
+    }
+
+    NIXL_INFO << "Loaded " << plugin->getName() << " device allocator " << plugin->getVersion()
+              << " from " << path;
+    return plugin;
+}
+
+std::shared_ptr<const nixlDeviceAllocatorPluginHandle>
+nixlPluginManager::loadDeviceAllocatorPlugin(nixlDeviceRuntime runtime) const {
+    const auto paths = device_allocator_plugin_paths_.find(runtime);
+    if (paths == device_allocator_plugin_paths_.end()) {
+        NIXL_INFO << "No " << deviceRuntimeName(runtime) << " device allocator plugin found";
+        return nullptr;
+    }
+
+    for (const auto &path : paths->second) {
+        if (auto plugin = loadDeviceAllocatorPluginFromPath(path, runtime)) {
+            return plugin;
+        }
+    }
+    NIXL_INFO << "No usable " << deviceRuntimeName(runtime) << " device allocator plugin found";
+    return nullptr;
+}
+
+nixlDeviceAllocator &
+nixlPluginManager::deviceAllocator() noexcept {
+    const std::lock_guard lock(mutex_);
+    if (selected_device_allocator_) {
+        return *selected_device_allocator_;
+    }
+
+    try {
+        const auto &hw_info = nixl::hwInfo::instance();
+        for (nixlDeviceRuntime runtime :
+             deviceAllocatorProbeOrder(hw_info.numNvidiaGpus, hw_info.numAmdGpus)) {
+            auto plugin = loadDeviceAllocatorPlugin(runtime);
+            if (plugin) {
+                selected_device_allocator_ = plugin->getAllocator();
+                device_allocator_handle_ = std::move(plugin);
+                return *selected_device_allocator_;
+            }
+        }
+    }
+    catch (const std::exception &e) {
+        NIXL_ERROR << "Failed to select a device allocator: " << e.what();
+    }
+
+    selected_device_allocator_ = &nixlGetUnsupportedDeviceAllocator();
+    NIXL_INFO << "No supported device allocator is available";
+    return *selected_device_allocator_;
 }
 
 void

@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "device/device_allocator.h"
+#include "device/device_allocator_plugin.h"
 
 #include <cuda_runtime.h>
 #include <string>
@@ -169,8 +169,9 @@ public:
 
 } // namespace
 
-extern "C" NIXL_DEVICE_ALLOCATOR_EXPORT nixlDeviceAllocator *
-nixlCreateCudaDeviceAllocator() noexcept {
+namespace {
+nixlDeviceAllocator *
+getCudaAllocator() noexcept {
     int device_count = 0;
     const cudaError_t error = cudaGetDeviceCount(&device_count);
     if (error == cudaErrorNoDevice) {
@@ -188,4 +189,19 @@ nixlCreateCudaDeviceAllocator() noexcept {
 
     static nixlCudaDeviceAllocator allocator;
     return &allocator;
+}
+} // namespace
+
+extern "C" NIXL_DEVICE_ALLOCATOR_EXPORT nixlDeviceAllocatorPluginV1 *
+nixl_device_allocator_plugin_init() noexcept {
+#ifdef NIXL_DEVICE_ALLOCATOR_HIP
+    constexpr nixlDeviceRuntime runtime = nixlDeviceRuntime::HIP;
+    constexpr const char *name = "HIP";
+#else
+    constexpr nixlDeviceRuntime runtime = nixlDeviceRuntime::CUDA;
+    constexpr const char *name = "CUDA";
+#endif
+    static nixlDeviceAllocatorPluginV1 plugin = {
+        NIXL_DEVICE_ALLOCATOR_PLUGIN_API_VERSION, runtime, name, "1.0.0", getCudaAllocator};
+    return &plugin;
 }
