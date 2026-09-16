@@ -54,7 +54,7 @@ TEST(ProxyRegistryLifetimeTest, ConcurrentGrowthAndUnusedRetirementPreserveLiveT
     std::vector<nixlMemViewH> added;
     for (size_t i = 0; i < 5000; ++i) {
         nixlMemViewH handle = nullptr;
-        EXPECT_EQ(registry.prepLocal(local, handle), NIXL_SUCCESS);
+        EXPECT_EQ(registry.prepRemote(remote, {nullptr}, handle), NIXL_SUCCESS);
         added.push_back(handle);
     }
     for (auto handle : added) {
@@ -93,6 +93,8 @@ TEST(ProxyRegistryLifetimeTest, RepeatedViewReplacementReclaimsAllocations) {
         EXPECT_EQ(prepared.remote.desc.addr, 0x2000 + i * 128);
         EXPECT_EQ(prepared.value, record.operand);
         ASSERT_EQ(registry.unregister(handle), NIXL_SUCCESS);
+        EXPECT_TRUE(allocator.wasFreed(handle));
+        EXPECT_EQ(registry.unregister(handle), NIXL_ERR_INVALID_PARAM);
         EXPECT_EQ(allocator.liveAllocations(), 0u);
     }
 }

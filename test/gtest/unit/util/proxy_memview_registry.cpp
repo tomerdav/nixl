@@ -111,20 +111,14 @@ namespace proxy_memview_registry {
         DummyBackendMD remote_md_;
     };
 
-    // The data path: every shape of record a worker can dequeue, resolved
-    // against the descriptors it names or rejected.
     TEST_F(ProxyMemViewRegistryTest, PrepareSubmissionResolvesAndValidates) {
         const uint64_t src = tokenOf(prepLocal(0x1000, 64, /*dev_id=*/7));
         const uint64_t dst = tokenOf(prepRemote("remote-agent", 0x2000, 64, /*dev_id=*/11));
-        const uint64_t unnamed = tokenOf(prepRemote(""));
-        const uint64_t null_agent = tokenOf(prepRemote(nixl_null_agent));
         const uint64_t empty = tokenOf(prepRemote(nixl_remote_meta_dlist_t(VRAM_SEG)));
         constexpr uint64_t kLarge = (uint64_t{1} << 32) + 64;
         const uint64_t big_src = tokenOf(prepLocal(0x5000, kLarge + 64));
         const uint64_t big_dst = tokenOf(prepRemote("peer", 0x6000, kLarge + 64));
 
-        // A put resolves both sides through the record's offsets and carries
-        // the record's own fields along.
         nixlBackendProxySubmission prepared;
         nixlProxySubmission record = put(src, dst, 16, 5, 9);
         record.op_idx = 7;
@@ -135,18 +129,10 @@ namespace proxy_memview_registry {
         EXPECT_EQ(prepared.opcode, nixl_proxy_opcode_t::PUT);
         EXPECT_EQ(prepared.size, 16u);
         EXPECT_EQ(prepared.local.mem_type, DRAM_SEG);
-        EXPECT_EQ(prepared.local.desc.addr, 0x1005u);
-        EXPECT_EQ(prepared.local.desc.len, 16u);
-        EXPECT_EQ(prepared.local.desc.devId, 7u);
-        EXPECT_EQ(prepared.local.desc.metadataP, &local_md_);
+        EXPECT_EQ(prepared.local.desc, nixlMetaDesc(0x1005, 16, 7, &local_md_));
         EXPECT_EQ(prepared.remote.mem_type, VRAM_SEG);
-        EXPECT_EQ(prepared.remote.desc.addr, 0x2009u);
-        EXPECT_EQ(prepared.remote.desc.len, 16u);
-        EXPECT_EQ(prepared.remote.desc.devId, 11u);
-        EXPECT_EQ(prepared.remote.desc.metadataP, &remote_md_);
+        EXPECT_EQ(prepared.remote.desc, nixlMetaDesc(0x2009, 16, 11, &remote_md_));
 
-        // An atomic add is sized by the counter, whatever the record says, and
-        // carries its value.
         record = atomicAdd(dst, 9, 42);
         record.size = 3;
         ASSERT_EQ(prepare(record, prepared), NIXL_SUCCESS);
@@ -156,7 +142,6 @@ namespace proxy_memview_registry {
         EXPECT_EQ(prepared.remote.desc.len, sizeof(uint64_t));
         EXPECT_EQ(prepared.value, 42u);
 
-        // Offsets and sizes are 64-bit end to end.
         ASSERT_EQ(prepare(put(big_src, big_dst, 32, kLarge, kLarge), prepared), NIXL_SUCCESS);
         EXPECT_EQ(prepared.local.desc.addr, uintptr_t{0x5000} + kLarge);
         EXPECT_EQ(prepared.remote.desc.addr, uintptr_t{0x6000} + kLarge);
@@ -164,13 +149,10 @@ namespace proxy_memview_registry {
         EXPECT_EQ(prepared.size, kLarge);
         EXPECT_EQ(prepared.local.desc.len, kLarge);
 
-        // A range may end exactly at the descriptor boundary.
         ASSERT_EQ(prepare(put(src, dst, 16, 48, 48), prepared), NIXL_SUCCESS);
         EXPECT_EQ(prepared.local.desc.addr, 0x1030u);
         EXPECT_EQ(prepared.remote.desc.addr, 0x2030u);
 
-        // Everything else is rejected, and a rejected record leaves the output
-        // untouched.
         nixlProxySubmission unsupported = atomicAdd(dst);
         unsupported.opcode = static_cast<nixl_proxy_opcode_t>(99);
 
@@ -188,8 +170,6 @@ namespace proxy_memview_registry {
              NIXL_ERR_INVALID_PARAM},
             {"counter past the end", atomicAdd(dst, 60), NIXL_ERR_INVALID_PARAM},
             {"roles swapped", put(dst, src, 16), NIXL_ERR_INVALID_PARAM},
-            {"empty remote agent", atomicAdd(unnamed), NIXL_ERR_INVALID_PARAM},
-            {"null remote agent", atomicAdd(null_agent), NIXL_ERR_INVALID_PARAM},
             {"empty descriptor list", atomicAdd(empty), NIXL_ERR_INVALID_PARAM},
             {"null tokens", put(0, 0, 16), NIXL_ERR_NOT_FOUND},
             {"unsupported opcode", unsupported, NIXL_ERR_NOT_SUPPORTED},
@@ -201,96 +181,53 @@ namespace proxy_memview_registry {
         }
     }
 
-    // The control path: handles, ids, and retirement.
-    TEST_F(ProxyMemViewRegistryTest, HandlesAndRetirement) {
-        // Each live token names a stable host view.
-        nixlMemViewH first = prepLocal(0x1000);
-        nixlMemViewH second = prepRemote("peer", 0x2000);
-        nixlMemViewH third = prepLocal(0x3000);
-        EXPECT_NE(first, second);
-        EXPECT_NE(second, third);
-        EXPECT_NE(first, third);
-        EXPECT_NE(tokenOf(first), 0u);
-        EXPECT_NE(tokenOf(second), 0u);
-        EXPECT_NE(tokenOf(third), 0u);
-        EXPECT_EQ(view(first).direct_ptr_count, 0u);
-        EXPECT_EQ(view(first).context, &context_);
+    TEST_F(ProxyMemViewRegistryTest, ViewsPreserveContextPointersAndDescriptorOrder) {
+        const nixlMemViewH src = prepLocal(0x1000);
+        EXPECT_EQ(view(src).direct_ptr_count, 0u);
+        EXPECT_EQ(view(src).context, &context_);
 
-        // A rejected prep leaves no allocation behind.
-        const size_t live = allocator_.liveAllocations();
-        nixl_remote_meta_dlist_t dram(DRAM_SEG);
-        dram.addDesc(makeRemoteDesc("peer", 0x2000, 64, 0, &remote_md_));
-        nixlMemViewH rejected = nullptr;
-        EXPECT_EQ(registry_.prepRemote(dram, {}, rejected), NIXL_ERR_INVALID_PARAM);
-        EXPECT_EQ(rejected, nullptr);
-        EXPECT_EQ(allocator_.liveAllocations(), live);
-
-        // Direct pointers are copied into the trailing run of the device view.
         DummyBackendMD peer1_md;
-        nixl_remote_meta_dlist_t two_peers(VRAM_SEG);
-        two_peers.addDesc(makeRemoteDesc("peer0", 0x4000, 64, 0, &remote_md_));
-        two_peers.addDesc(makeRemoteDesc("peer1", 0x5000, 64, 1, &peer1_md));
+        nixl_remote_meta_dlist_t peers(VRAM_SEG);
+        peers.addDesc(makeRemoteDesc("peer0", 0x4000, 64, 0, &remote_md_));
+        peers.addDesc(makeRemoteDesc("peer1", 0x5000, 64, 1, &peer1_md));
         const std::vector<void *> direct_ptrs{reinterpret_cast<void *>(uintptr_t{0xfeed0000}),
                                               nullptr};
-        nixlMemViewH fourth = prepRemote(two_peers, direct_ptrs);
-        EXPECT_NE(tokenOf(fourth), 0u);
-        ASSERT_EQ(view(fourth).direct_ptr_count, 2u);
-        void *const *stored = nixlProxyDeviceMemViewDirectPtrs(&view(fourth));
+        const nixlMemViewH dst = prepRemote(peers, direct_ptrs);
+        ASSERT_EQ(view(dst).direct_ptr_count, 2u);
+        void *const *stored = nixlProxyDeviceMemViewDirectPtrs(&view(dst));
         EXPECT_EQ(std::vector<void *>(stored, stored + 2), direct_ptrs);
 
-        // Retiring frees the view and leaves other live views usable.
-        ASSERT_EQ(registry_.unregister(second), NIXL_SUCCESS);
-        EXPECT_TRUE(allocator_.wasFreed(second));
-        EXPECT_EQ(registry_.unregister(second), NIXL_ERR_INVALID_PARAM);
-        nixlBackendProxySubmission prepared;
-        ASSERT_EQ(prepare(put(tokenOf(first), tokenOf(fourth), 8), prepared), NIXL_SUCCESS);
-        EXPECT_EQ(prepared.remote.desc.addr, 0x4000u);
-        EXPECT_NE(tokenOf(prepRemote()), 0u);
-
-        // Peer indices are relative to the view, not global identities.
         nixl_remote_meta_dlist_t reversed(VRAM_SEG);
-        reversed.addDesc(two_peers[1]);
-        reversed.addDesc(two_peers[0]);
-        for (auto handle : {fourth, prepRemote(reversed)}) {
+        reversed.addDesc(peers[1]);
+        reversed.addDesc(peers[0]);
+        for (auto handle : {dst, prepRemote(reversed)}) {
             for (uint64_t index = 0; index < 2; ++index) {
-                auto record = put(tokenOf(first), tokenOf(handle), 8);
+                auto record = put(tokenOf(src), tokenOf(handle), 8);
                 record.dst_index = index;
-                const auto &expected = two_peers[handle == fourth ? index : 1 - index];
+                auto expected = static_cast<nixlMetaDesc>(peers[handle == dst ? index : 1 - index]);
+                expected.len = record.size;
+                nixlBackendProxySubmission prepared;
                 ASSERT_EQ(prepare(record, prepared), NIXL_SUCCESS);
-                EXPECT_EQ(prepared.remote.desc.addr, expected.addr);
-                EXPECT_EQ(prepared.remote.desc.devId, expected.devId);
-                EXPECT_EQ(prepared.remote.desc.metadataP, expected.metadataP);
+                EXPECT_EQ(prepared.remote.desc, expected);
             }
         }
     }
 
-    TEST_F(ProxyMemViewRegistryTest, FailedPrepAndViewGrowth) {
+    TEST_F(ProxyMemViewRegistryTest, FailedPreparationRollsBack) {
         nixl_remote_meta_dlist_t dlist(VRAM_SEG);
         dlist.addDesc(makeRemoteDesc("peer", 0x2000, 64, 0, &remote_md_));
         nixlMemViewH handle = &context_;
-        nixlBackendProxySubmission prepared;
         for (int fail_after : {0, 1, 2}) { // Allocation, header copy, direct-pointer copy.
             SCOPED_TRACE(fail_after);
             allocator_.fail_after = fail_after;
             EXPECT_EQ(registry_.prepRemote(dlist, {nullptr}, handle), NIXL_ERR_BACKEND);
             EXPECT_EQ(handle, &context_);
             EXPECT_EQ(allocator_.liveAllocations(), 0u);
-            EXPECT_EQ(registry_.prepareSubmission(atomicAdd(0), prepared), NIXL_ERR_NOT_FOUND);
         }
-        std::vector<nixlMemViewH> handles;
-        for (uint64_t id = 1; id <= 4097; ++id) {
-            ASSERT_EQ(registry_.prepRemote(dlist, {nullptr}, handle), NIXL_SUCCESS);
-            EXPECT_NE(tokenOf(handle), 0u);
-            handles.push_back(handle);
-        }
-        for (auto live : handles) {
-            const auto id = tokenOf(live);
-            ASSERT_EQ(registry_.prepareSubmission(atomicAdd(id), prepared), NIXL_SUCCESS);
-            ASSERT_EQ(registry_.unregister(live), NIXL_SUCCESS);
-        }
-        ASSERT_EQ(registry_.prepRemote(dlist, {nullptr}, handle), NIXL_SUCCESS);
-        EXPECT_NE(tokenOf(handle), 0u);
-        ASSERT_EQ(registry_.unregister(handle), NIXL_SUCCESS);
+        nixl_remote_meta_dlist_t dram(DRAM_SEG);
+        dram.addDesc(dlist[0]);
+        EXPECT_EQ(registry_.prepRemote(dram, {}, handle), NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(handle, &context_);
         EXPECT_EQ(allocator_.liveAllocations(), 0u);
     }
 
@@ -299,16 +236,16 @@ namespace proxy_memview_registry {
         dlist.addDesc(nixlRemoteMetaDesc(nixl_null_agent));
         dlist.addDesc(makeRemoteDesc("peer", 0x2000, 64, 7, &remote_md_));
         dlist.addDesc(nixlRemoteMetaDesc(""));
-        const auto id = tokenOf(prepRemote(dlist));
+        const auto token = tokenOf(prepRemote(dlist));
         nixlBackendProxySubmission prepared;
         for (uint64_t index = 0; index < 3; ++index) {
-            auto record = atomicAdd(id, 8);
+            auto record = atomicAdd(token, 8);
             record.dst_index = index;
             EXPECT_EQ(prepare(record, prepared),
                       index == 1 ? NIXL_SUCCESS : NIXL_ERR_INVALID_PARAM);
         }
         EXPECT_EQ(prepared.remote.desc, nixlMetaDesc(0x2008, 8, 7, &remote_md_));
-        auto record = atomicAdd(id, 16);
+        auto record = atomicAdd(token, 16);
         record.dst_index = 1;
         ASSERT_EQ(prepare(record, prepared), NIXL_SUCCESS);
         EXPECT_EQ(prepared.remote.desc, nixlMetaDesc(0x2010, 8, 7, &remote_md_));

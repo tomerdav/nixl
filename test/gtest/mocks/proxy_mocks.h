@@ -36,22 +36,7 @@
 namespace gtest {
 namespace proxy_mocks {
 
-    /**
-     * Host-memory stand-in for the GPU allocator, so the device proxy can be
-     * tested without a GPU.
-     *
-     * Device memory is ordinary host memory: a test reads what the code under
-     * test wrote to the device by dereferencing the device pointer. Mapped host
-     * memory has two aliases, as it does on real hardware. The host alias is the
-     * allocation; the device alias is a tagged pointer that cannot be
-     * dereferenced. A test playing the GPU translates the device alias it finds
-     * in a device-visible structure back with hostAlias(). Code that mixes the
-     * two up fails that translation or faults, instead of passing because both
-     * aliases happened to be the same address.
-     *
-     * Also records what was freed, which is how lifetime tests observe retirement
-     * and shutdown.
-     */
+    /** Host-backed allocations with distinct device aliases to catch incorrect publication. */
     class MockDeviceAllocator : public nixlDeviceAllocator {
     public:
         /** Fail once after N allocation/H2D calls; -1 disables injection. */
@@ -94,11 +79,7 @@ namespace proxy_mocks {
             return NIXL_SUCCESS;
         }
 
-        /**
-         * The host alias behind a mapped allocation's device alias, or null for a
-         * pointer that is not one: a host pointer published where the GPU expects
-         * a device alias, or an alias into memory that was already freed.
-         */
+        /** Translate a live mapped device alias; reject host and freed pointers. */
         template<class T>
         T *
         hostAlias(const T *device_alias) const {
@@ -188,8 +169,7 @@ namespace proxy_mocks {
 
         void *
         allocate(size_t size) noexcept {
-            // Cache-line aligned so the control buffer's GPU-page rounding stays
-            // in bounds, and zeroed like freshly allocated device memory.
+            // Match control-buffer alignment; zeroing makes tests deterministic.
             const size_t rounded = std::max<size_t>(64, (size + 63) & ~size_t{63});
             void *allocation = std::aligned_alloc(64, rounded);
             if (allocation == nullptr) {

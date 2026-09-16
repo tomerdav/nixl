@@ -29,11 +29,7 @@
 #include "proxy_backend_ops.h"
 #include "proxy_protocol.h"
 
-/**
- * Owns prepared views. Control calls are serialized; workers use live host tokens.
- * Tokens must remain valid until their submissions finish; stale tokens are invalid usage.
- * Destruction requires all users to have stopped.
- */
+/** Owns views until retirement; workers borrow live tokens without accessing the map. */
 class nixlProxyMemViewRegistry {
 public:
     nixlProxyMemViewRegistry(nixlDeviceAllocator &allocator,
@@ -46,7 +42,6 @@ public:
     [[nodiscard]] nixl_status_t
     prepLocal(const nixl_meta_dlist_t &dlist, nixlMemViewH &out);
 
-    /** Copies direct_ptrs into the device view for GPU direct access. */
     [[nodiscard]] nixl_status_t
     prepRemote(const nixl_remote_meta_dlist_t &dlist,
                const std::vector<void *> &direct_ptrs,
@@ -69,9 +64,7 @@ private:
 
     struct RegistryEntry {
         nixlMemViewH proxy_memview = nullptr;
-        /** Owns the device-resident nixlProxyDeviceMemView; freed by unregister(). */
         nixlDeviceMem proxy_memview_mem;
-        /** Remote entries are transfer destinations, local ones sources. */
         bool remote = false;
         nixl_mem_t mem_type = DRAM_SEG;
         std::vector<StoredDesc> descs;
