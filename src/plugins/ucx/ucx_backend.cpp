@@ -73,8 +73,7 @@ nixlUcxEngine::create(const nixlBackendInitParams &init_params) {
         nixl::getBackendParamDefaulted(init_params.customParams, "num_threads", 0u);
 
 #ifndef HAVE_NIXL_DEVICE_API
-    // Without CUDA the GPU Device API, and so the device proxy, does not
-    // exist. Reject the parameters rather than accept and ignore them.
+    // Reject proxy parameters when the device API is not built.
     if (init_params.customParams != nullptr) {
         for (const auto &[key, value] : *init_params.customParams) {
             if (key == "device_proxy" || key.rfind("proxy_", 0) == 0) {
@@ -94,9 +93,7 @@ nixlUcxEngine::create(const nixlBackendInitParams &init_params) {
             nixl::throwRuntimeError("num_threads is not supported with device_proxy=true");
         }
 
-        // The proxy topology dictates the shared-worker count: one UCX worker
-        // per channel x peer slot. Deriving it here, rather than trusting the
-        // caller, keeps the two from disagreeing.
+        // Each channel/peer ring needs its own UCX worker.
         const size_t derived_workers = proxy_config.ringCount();
         const auto explicit_workers =
             nixl::getBackendParamOptional<size_t>(init_params.customParams, "num_workers");
@@ -121,9 +118,7 @@ nixlUcxEngine::create(const nixlBackendInitParams &init_params) {
         proxy_init_params.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
 
         auto engine = std::unique_ptr<nixlUcxEngine>(new nixlUcxEngine(proxy_init_params));
-        // The workers exist and the engine is fully constructed; starting the
-        // runtime is deliberately the last step, because its threads call back
-        // into the engine as soon as they run.
+        // Start proxy callbacks only after the engine is fully constructed.
         const nixl_status_t status = engine->setupProxyRuntime(proxy_config);
         if (status != NIXL_SUCCESS) {
             nixl::throwRuntimeError("failed to start device proxy runtime: status=", status);
@@ -407,14 +402,6 @@ nixl_status_t nixlUcxEngine::disconnect(const std::string &remote_agent) {
     // thread safety?
     remoteConnMap.erase(it);
 
-#ifdef HAVE_NIXL_DEVICE_API
-    if (proxyRuntime_) {
-        const nixl_status_t proxy_status = proxyRuntime_->remoteDisconnected(remote_agent);
-        if (proxy_status != NIXL_SUCCESS) {
-            return proxy_status;
-        }
-    }
-#endif
     return NIXL_SUCCESS;
 }
 
@@ -438,19 +425,6 @@ nixl_status_t nixlUcxEngine::loadRemoteConnInfo (const std::string &remote_agent
         }
         conn->eps.push_back(std::move(ep));
     }
-
-#ifdef HAVE_NIXL_DEVICE_API
-    // Forward before registering the connection: a proxy failure must leave no
-    // remoteConnMap entry behind, or a retry would hit the duplicate check
-    // above and the proxy would never receive the connection info.
-    if (proxyRuntime_) {
-        const nixl_status_t proxy_status =
-            proxyRuntime_->loadRemoteConnInfo(remote_agent, remote_conn_info);
-        if (proxy_status != NIXL_SUCCESS) {
-            return proxy_status;
-        }
-    }
-#endif
 
     remoteConnMap.insert({remote_agent, conn});
 
@@ -719,10 +693,7 @@ nixlUcxEngine::releaseProxyRequest(size_t worker_id, nixlUcxReq req) const {
         return;
     }
 
-    // Deliberately no ucp_request_cancel: it acts only on tag receives and is
-    // a no-op for every send the proxy posts, so calling it only implied a
-    // cancellation that never happened. Releasing is bookkeeping; the
-    // operation itself ends when the transport says so.
+    // The caller has observed terminal completion.
     getSharedWorker(worker_id)->reqRelease(req);
 }
 
@@ -1151,9 +1122,6 @@ nixlUcxEngine::prepMemViewImpl(const DlistT &dlist,
 
 nixl_status_t
 nixlUcxEngine::wrapMemView(nixlMemViewH backend_mvh, nixlMemViewH &mvh) const {
-    // Device code reaches an implementation through the handle, not through a
-    // build-time choice, so what leaves here is a tagged wrapper rather than
-    // the bare backend handle.
     const nixl_device_exec_mode_t mode = proxyRuntime_ ? nixl_device_exec_mode_t::PROXY :
                                                          nixl_device_exec_mode_t::UCX_DIRECT;
     const nixl_status_t status = nixlDeviceMemViewAllocate(mode, backend_mvh, mvh);
