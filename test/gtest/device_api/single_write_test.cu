@@ -164,10 +164,7 @@ using TestParams = std::tuple<bool, nixl_gpu_level_t>;
 
 class SingleWriteTest : public testing::TestWithParam<TestParams> {
 protected:
-    std::string
-    getBackendName() const {
-        return "UCX";
-    }
+    std::string getBackendName() const { return "UCX"; }
 
     bool
     isProxy() const {
@@ -265,9 +262,7 @@ protected:
             ASSERT_EQ(status, NIXL_SUCCESS);
 
             for (size_t j = 0; j < agents.size(); j++) {
-                if (i == j) {
-                    continue;
-                }
+                if (i == j) continue;
                 std::string remote_agent_name;
                 status = agents[j]->loadRemoteMD(md, remote_agent_name);
                 ASSERT_EQ(status, NIXL_SUCCESS);
@@ -280,9 +275,7 @@ protected:
     invalidateMD() {
         for (size_t i = 0; i < agents.size(); i++) {
             for (size_t j = 0; j < agents.size(); j++) {
-                if (i == j) {
-                    continue;
-                }
+                if (i == j) continue;
                 nixl_status_t status = agents[j]->invalidateRemoteMD(getAgentName(i));
                 ASSERT_EQ(status, NIXL_SUCCESS);
             }
