@@ -115,7 +115,7 @@ namespace proxy_mocks {
 
     protected:
         nixl_status_t
-        doAllocDeviceMem(void **ptr, size_t size) noexcept override {
+        doAllocDeviceMem(void *&ptr, size_t size) noexcept override {
             if (fail_after >= 0 && fail_after-- == 0) {
                 return NIXL_ERR_BACKEND;
             }
@@ -123,7 +123,7 @@ namespace proxy_mocks {
             if (allocation == nullptr) {
                 return NIXL_ERR_BACKEND;
             }
-            *ptr = allocation;
+            ptr = allocation;
             return NIXL_SUCCESS;
         }
 
@@ -133,7 +133,7 @@ namespace proxy_mocks {
         }
 
         nixl_status_t
-        doAllocMappedHostMem(void **host_ptr, void **dev_ptr, size_t size) noexcept override {
+        doAllocMappedHostMem(void *&host_ptr, void *&dev_ptr, size_t size) noexcept override {
             void *allocation = allocate(size);
             if (allocation == nullptr) {
                 return NIXL_ERR_BACKEND;
@@ -142,8 +142,8 @@ namespace proxy_mocks {
                 const std::lock_guard<std::mutex> lock(mutex_);
                 mapped_[reinterpret_cast<uintptr_t>(allocation)] = size;
             }
-            *host_ptr = allocation;
-            *dev_ptr =
+            host_ptr = allocation;
+            dev_ptr =
                 reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(allocation) | kDeviceAliasTag);
             return NIXL_SUCCESS;
         }
