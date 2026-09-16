@@ -161,10 +161,7 @@ launchPutKernel(const putParams &put_params,
 
 class SingleWriteTest : public DeviceApiTestBase {
 protected:
-    std::string
-    getBackendName() const {
-        return "UCX";
-    }
+    std::string getBackendName() const { return "UCX"; }
 
     static nixlAgentConfig
     getConfig() {
@@ -251,9 +248,7 @@ protected:
             ASSERT_EQ(status, NIXL_SUCCESS);
 
             for (size_t j = 0; j < agents.size(); j++) {
-                if (i == j) {
-                    continue;
-                }
+                if (i == j) continue;
                 std::string remote_agent_name;
                 status = agents[j]->loadRemoteMD(md, remote_agent_name);
                 ASSERT_EQ(status, NIXL_SUCCESS);
@@ -266,9 +261,7 @@ protected:
     invalidateMD() {
         for (size_t i = 0; i < agents.size(); i++) {
             for (size_t j = 0; j < agents.size(); j++) {
-                if (i == j) {
-                    continue;
-                }
+                if (i == j) continue;
                 nixl_status_t status = agents[j]->invalidateRemoteMD(getAgentName(i));
                 ASSERT_EQ(status, NIXL_SUCCESS);
             }
@@ -570,10 +563,10 @@ TEST_P(SingleWriteTest, SingleWorkerPutGap) {
 
 using gtest::nixl::gpu::single_write::SingleWriteTest;
 
-INSTANTIATE_TEST_SUITE_P(ucxDeviceApi,
-                         SingleWriteTest,
-                         testing::ValuesIn(gtest::gpu::_test_levels),
-                         [](const testing::TestParamInfo<nixl_gpu_level_t> &info) {
-                             return std::string("UCX_") +
-                                 gtest::gpu::GetGpuXferLevelStr(info.param);
-                         });
+INSTANTIATE_TEST_SUITE_P(
+    ucxDeviceApi,
+    SingleWriteTest,
+    testing::ValuesIn(gtest::gpu::_test_levels),
+    [](const testing::TestParamInfo<nixl_gpu_level_t> &info) {
+        return std::string("UCX_") + gtest::gpu::GetGpuXferLevelStr(info.param);
+    });
