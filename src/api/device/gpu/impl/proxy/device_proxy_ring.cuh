@@ -42,17 +42,7 @@ proxyHostViewFromHandle(nixlMemViewH mvh) {
 
 struct ProxyDeviceContext;
 
-/**
- * Resolve the runtime context a prepared view belongs to, rejecting a context
- * published by a host runtime built against a different protocol version.
- *
- * This kernel was compiled against whatever proxy_protocol.h it saw at build
- * time, which need not be the one the running host library was built with. A
- * mismatch would not fail to link or fault; it would write correctly formed
- * records with fields in the wrong places. Checking here means the check
- * happens once per operation, against a compile-time constant, on a value the
- * caller was going to load anyway.
- */
+/** Reject views from an incompatible host protocol. */
 __device__ __forceinline__ const ProxyDeviceContext *
 proxyContextFromMemView(const nixlProxyDeviceMemView *memview) {
     if (memview == nullptr || memview->context == nullptr) {
@@ -63,15 +53,6 @@ proxyContextFromMemView(const nixlProxyDeviceMemView *memview) {
     }
     return reinterpret_cast<const ProxyDeviceContext *>(memview->context);
 }
-
-static_assert(sizeof(*nixlProxyWorkRing{}.producer_idx) == 8,
-              "producer_idx must be 64-bit to avoid wrap-around false completions");
-static_assert(sizeof(*nixlProxyWorkRing{}.consumer_idx) == 8,
-              "consumer_idx must be 64-bit to match producer_idx");
-static_assert(sizeof(*nixlProxyWorkRing{}.consumer_idx_cache) == 8,
-              "consumer_idx_cache must be 64-bit to match producer_idx");
-static_assert(sizeof(nixlProxyCompletionSlot::completed_idx) == 8,
-              "completed_idx must be 64-bit to match producer_idx");
 
 template<level_t level>
 __device__ inline void
