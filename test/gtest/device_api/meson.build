@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The proxy producer depends on CUDA and the host proxy runtime, but not on
-# UCX's direct GPU API. Keep it separate so it still runs on the configurations
-# where the proxy is the required fallback.
+# Proxy tests also run without UCX's direct GPU API.
 proxy_device_api_test_sources = files(
     'proxy_write_test.cu',
 )
