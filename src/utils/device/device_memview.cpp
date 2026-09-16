@@ -30,7 +30,7 @@ nixlDeviceMemViewAllocate(nixl_device_exec_mode_t execution_mode,
         execution_mode,
         backend_memview,
     };
-    status = allocator.copyHostToDevice(wrapper_mem.get(), &host_wrapper, sizeof(host_wrapper));
+    status = allocator.copyHostToDevice(wrapper_mem.devicePointer(), &host_wrapper, sizeof(host_wrapper));
     if (status != NIXL_SUCCESS) {
         return status;
     }

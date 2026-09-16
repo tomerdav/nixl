@@ -80,15 +80,7 @@ namespace detail {
         return static_cast<exec_mode_t>(execution_mode);
     }
 
-    /**
-     * Record which implementation owns this status handle, so a later poll
-     * can find its way back to the same one.
-     *
-     * Tagged on any accepted submission, not only on NIXL_IN_PROG: the UCX
-     * arm reports an operation that completed inline as NIXL_SUCCESS, and
-     * such a handle is still a legal argument to getXferStatus. Leaving it
-     * untagged would make that poll read mode zero and fail.
-     */
+    /** Tag accepted submissions, including inline success, for later dispatch by getXferStatus. */
     template<level_t level>
     __device__ __forceinline__ void
     writeExecutionMode(xferStatusH *status,
