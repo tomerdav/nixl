@@ -46,10 +46,7 @@ struct nixlProxyRequestState {
 
 struct alignas(64) nixlProxyChannelState {
     nixlProxyChannelView device_view{};
-    /**
-     * Per-ring-slot backend state. A submitted record remains associated with
-     * its ring slot until completion advances consumer_idx_shadow_ past it.
-     */
+    /** In-flight state retained until the completion frontier passes its ring slot. */
     std::vector<nixlProxyRequestState> inflight_slots_;
     /** Host-only submit frontier; consumer_idx_shadow_ remains the completion frontier. */
     uint64_t submit_idx_ = 0;
@@ -90,21 +87,11 @@ struct alignas(64) nixlProxyChannelState {
              nixlProxyControlBuffer *control_slots,
              size_t control_slot_index);
 
-
-    /**
-     * Put an allocated ring back to the state allocate() left it in - empty,
-     * indices zeroed on both sides, completion latch cleared - without
-     * releasing any memory. The caller must have established that nobody is
-     * producing into or consuming from the ring.
-     */
+    /** Reset an allocated ring after producers stop and backend work is quiescent. */
     nixl_status_t
     rearm() noexcept;
 
-    /**
-     * Nothing left for this ring to do: everything submitted has completed and
-     * no published record is waiting to be picked up. Exactly the condition
-     * under which ProxyWorker's ordinary pass would be a no-op.
-     */
+    /** No submitted or published work remains. */
     [[nodiscard]] bool
     drained() const noexcept;
 
@@ -145,25 +132,12 @@ public:
     nixlProxyRuntime &
     operator=(const nixlProxyRuntime &) = delete;
 
-    /**
-     * Build a ready - but not yet running - runtime, or fail leaving `out`
-     * untouched. All device memory comes from `allocator`, which must
-     * outlive the runtime. startWorkers() is a separate, later call: the
-     * worker threads call back into the backend that owns the runtime, so
-     * the owner has to be fully constructed first.
-     */
+    /** Build without starting workers; allocator must outlive the runtime. */
     [[nodiscard]] static nixl_status_t
     create(nixlProxyBackendOps backend_ops,
            const nixlProxyConfig &config,
            std::unique_ptr<nixlProxyRuntime> &out,
            nixlDeviceAllocator &allocator = nixlGetDeviceAllocator());
-
-    nixl_status_t
-    loadRemoteConnInfo(const std::string &remote_name, const nixl_blob_t &conn_info);
-
-    nixl_status_t
-    remoteDisconnected(const std::string &remote_name);
-
 
     [[nodiscard]] nixl_status_t
     prepMemView(const nixl_meta_dlist_t &dlist, nixlMemViewH *proxy_memview);
@@ -175,17 +149,11 @@ public:
     [[nodiscard]] nixl_status_t
     unregisterProxyMemView(nixlMemViewH proxy_memview);
 
-
     [[nodiscard]] nixl_status_t
     startWorkers();
 
     nixl_status_t
     shutdown();
-
-    const nixlProxyMemViewRegistry &
-    memviewRegistry() const {
-        return *memview_registry_;
-    }
 
     const nixlProxyChannelView *
     deviceChannelViews() const {
@@ -198,15 +166,9 @@ public:
     }
 
 private:
-    /**
-     * Drive every ring to a terminal state and rearm it, so that memviews
-     * the records reference can be retired without dropping work. The
-     * workers do the ring-state changes; this only raises the request and
-     * waits for them, so nothing here touches a ring.
-     */
+    /** Ask owning workers to drain and reset, then wait for their acknowledgments. */
     void
     drainChannels() noexcept;
-
 
     nixlProxyRuntime(nixlProxyBackendOps backend_ops,
                      const nixlProxyConfig &config,
@@ -229,8 +191,7 @@ private:
     nixlDeviceMem device_channel_views_mem_;
     nixlDeviceMem device_context_mem_;
     std::vector<std::unique_ptr<ProxyWorker>> workers_;
-    /** Built in build(), once the device context it stamps into memviews
-     *  exists; destroyed by shutdown(), which frees every memview with it. */
+    /** Created after the device context; destroyed after workers stop. */
     std::unique_ptr<nixlProxyMemViewRegistry> memview_registry_;
     alignas(64) std::atomic<uint64_t> shutdown_state_{
         static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN)};

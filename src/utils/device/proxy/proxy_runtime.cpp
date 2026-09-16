@@ -66,7 +66,7 @@ nixlProxyChannelState::allocate(nixlDeviceAllocator &allocator,
         consumer_idx_cache_mem_.as<uint64_t>(),
         depth,
     };
-    if (allocator.copyHostToDevice(work_ring_mem_.get(), &work_ring, sizeof(work_ring)) !=
+    if (allocator.copyHostToDevice(work_ring_mem_.devicePointer(), &work_ring, sizeof(work_ring)) !=
         NIXL_SUCCESS) {
         deallocate();
         return NIXL_ERR_BACKEND;
@@ -75,7 +75,7 @@ nixlProxyChannelState::allocate(nixlDeviceAllocator &allocator,
                                        completion_slot_mem_.asDev<nixlProxyCompletionSlot>()};
 
     NIXL_DEBUG << "Proxy ring: depth=" << depth << " control_slot=" << control_slot_index
-              << " records(dev)=" << records_mem_.devPtr();
+              << " records(dev)=" << records_mem_.devicePointer();
     return NIXL_SUCCESS;
 }
 
@@ -89,15 +89,12 @@ nixlProxyChannelState::rearm() noexcept {
     for (uint32_t i = 0; i < ring_depth_; ++i) {
         records_host[i] = nixlProxySubmission{};
     }
-    if (allocator_->memsetDeviceMem(producer_idx_mem_.get(), 0, sizeof(uint64_t)) != NIXL_SUCCESS ||
-        allocator_->memsetDeviceMem(consumer_idx_cache_mem_.get(), 0, sizeof(uint64_t)) !=
+    if (allocator_->memsetDeviceMem(producer_idx_mem_.devicePointer(), 0, sizeof(uint64_t)) != NIXL_SUCCESS ||
+        allocator_->memsetDeviceMem(consumer_idx_cache_mem_.devicePointer(), 0, sizeof(uint64_t)) !=
             NIXL_SUCCESS) {
         return NIXL_ERR_BACKEND;
     }
-    // A memset is only enqueued. The producer kernel reads both words, and a
-    // stream created non-blocking - as PyTorch does - is not ordered against
-    // the default stream, so the zeroing must land before the ring is handed
-    // back. Once per reset, off the submission path.
+    // Non-blocking producer streams must see the reset before reuse.
     if (allocator_->synchronize() != NIXL_SUCCESS) {
         return NIXL_ERR_BACKEND;
     }
@@ -107,8 +104,7 @@ nixlProxyChannelState::rearm() noexcept {
 
     submit_idx_ = 0;
     inflight_slots_.assign(ring_depth_, nixlProxyRequestState{});
-    // Clearing the latch last: until it goes back to NIXL_IN_PROG the GPU
-    // would read a stale terminal status for the next generation of work.
+    // Clear the old completion latch before reusing the ring.
     completionSlotHost()->completion_status = NIXL_IN_PROG;
     __atomic_store_n(&completionSlotHost()->completed_idx, uint64_t{0}, __ATOMIC_RELEASE);
     return NIXL_SUCCESS;
@@ -121,7 +117,7 @@ nixlProxyChannelState::verifyDrained() const noexcept {
     }
     uint64_t produced = 0;
     if (!drained() ||
-        allocator_->copyDeviceToHost(&produced, producer_idx_mem_.get(), sizeof(produced)) !=
+        allocator_->copyDeviceToHost(&produced, producer_idx_mem_.devicePointer(), sizeof(produced)) !=
             NIXL_SUCCESS ||
         produced != submit_idx_) {
         NIXL_FATAL << "Proxy ring has unfinished or unpublished producer tickets";
@@ -136,9 +132,7 @@ nixlProxyChannelState::drained() const noexcept {
     if (consumer_idx_shadow_ != submit_idx_) {
         return false;
     }
-    // Catching up to submit_idx_ is not enough: records the GPU published but
-    // no worker has picked up yet sit past it. Same readiness test
-    // ProxyWorker::submitReady() uses.
+    // Include published records that have not been submitted yet.
     const uint32_t slot = static_cast<uint32_t>(submit_idx_ % ring_depth_);
     return __atomic_load_n(&recordsHost()[slot].op_idx, __ATOMIC_ACQUIRE) == 0;
 }
@@ -204,8 +198,6 @@ nixlProxyRuntime::create(nixlProxyBackendOps backend_ops,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // Held locally so a failed build tears itself down; `out` is only written
-    // once the runtime is complete.
     std::unique_ptr<nixlProxyRuntime> runtime(
         new nixlProxyRuntime(std::move(backend_ops), config, allocator));
     const nixl_status_t status = runtime->build();
@@ -252,7 +244,7 @@ nixlProxyRuntime::build() {
 
     if (allocator_.allocDeviceMem(sizeof(nixlProxyChannelView) * channel_slots,
                                   device_channel_views_mem_) != NIXL_SUCCESS ||
-        allocator_.copyHostToDevice(device_channel_views_mem_.get(),
+        allocator_.copyHostToDevice(device_channel_views_mem_.devicePointer(),
                                     device_channel_views_.data(),
                                     sizeof(nixlProxyChannelView) * channel_slots) != NIXL_SUCCESS) {
         return NIXL_ERR_BACKEND;
@@ -267,7 +259,7 @@ nixlProxyRuntime::build() {
     if (allocator_.allocDeviceMem(sizeof(nixlProxyDeviceContextData), device_context_mem_) !=
             NIXL_SUCCESS ||
         allocator_.copyHostToDevice(
-            device_context_mem_.get(), &device_context, sizeof(device_context)) != NIXL_SUCCESS) {
+            device_context_mem_.devicePointer(), &device_context, sizeof(device_context)) != NIXL_SUCCESS) {
         return NIXL_ERR_BACKEND;
     }
     memview_registry_ = std::make_unique<nixlProxyMemViewRegistry>(allocator_, deviceContext());
@@ -290,28 +282,6 @@ nixlProxyRuntime::build() {
 }
 
 nixl_status_t
-nixlProxyRuntime::loadRemoteConnInfo(const std::string &remote_name, const nixl_blob_t &conn_info) {
-    NIXL_INFO << "ProxyRuntime::loadRemoteConnInfo: remote='" << remote_name
-              << "' conn_info_size=" << conn_info.size();
-
-    if (!backend_ops_.on_remote_loaded) {
-        return NIXL_SUCCESS;
-    }
-    const nixl_status_t rc = backend_ops_.on_remote_loaded(remote_name, conn_info);
-    NIXL_INFO << "ProxyRuntime::loadRemoteConnInfo: result=" << rc;
-    return rc;
-}
-
-nixl_status_t
-nixlProxyRuntime::remoteDisconnected(const std::string &remote_name) {
-    NIXL_INFO << "ProxyRuntime::remoteDisconnected: remote='" << remote_name << "'";
-    if (!backend_ops_.on_remote_disconnected) {
-        return NIXL_SUCCESS;
-    }
-    return backend_ops_.on_remote_disconnected(remote_name);
-}
-
-nixl_status_t
 nixlProxyRuntime::prepMemView(const nixl_meta_dlist_t &dlist, nixlMemViewH *proxy_memview) {
     const std::lock_guard lock(control_mutex_);
     if (proxy_memview == nullptr || memview_registry_ == nullptr) {
@@ -326,7 +296,6 @@ nixlProxyRuntime::prepMemView(const nixl_remote_meta_dlist_t &dlist, nixlMemView
     if (proxy_memview == nullptr || memview_registry_ == nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
-
 
     std::vector<void *> direct_ptrs;
     if (backend_ops_.resolve_direct_ptrs) {
@@ -346,9 +315,7 @@ nixlProxyRuntime::unregisterProxyMemView(nixlMemViewH proxy_memview) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // Records already in the rings still name this memview. Retiring it under
-    // them is how queued transfers - including ones to healthy peers - used to
-    // disappear at a membership change (repo docs/issues/005, G1).
+    // Queued records still borrow the view being retired.
     drainChannels();
     return memview_registry_->unregister(proxy_memview);
 }

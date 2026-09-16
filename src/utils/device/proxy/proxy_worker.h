@@ -46,9 +46,6 @@ class ProxyWorker {
 
         void join() noexcept;
 
-        void
-        runOnce();
-
         /** The drain generation this worker has fully applied. */
         [[nodiscard]] uint64_t
         drainAcked() const noexcept {
@@ -56,14 +53,13 @@ class ProxyWorker {
         }
 
     private:
+        void
+        runOnce();
+
         nixlProxyChannelState *
         getChannelState(uint32_t peer, uint32_t channel_id);
 
-        /**
-         * Apply fn(channel, channel_id, peer) to every ring this worker owns.
-         * Channels are striped across workers; a worker owns every peer of the
-         * channels assigned to it. The one definition of that ownership.
-         */
+        /** Visit all peers of the channels striped to this worker. */
         template<typename Fn>
         void
         forEachOwnedChannel(Fn &&fn);
@@ -71,11 +67,7 @@ class ProxyWorker {
         [[nodiscard]] bool
         ownedChannelsDrained();
 
-        /**
-         * Drive every owned ring to a terminal state and rearm it. Runs on the
-         * worker thread because the worker is the only writer of the ring
-         * state involved, so no application thread ever touches it.
-         */
+        /** Drain, quiesce and reset on the ring's owning thread. */
         void
         drainOwnedChannels();
 

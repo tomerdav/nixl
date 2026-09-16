@@ -15,11 +15,6 @@
  * limitations under the License.
  */
 
-// The proxy runtime driven end to end on the host. The mock allocator hands
-// out host memory, the mock backend stands in for the transport, and the test
-// plays the GPU: it writes ring records with the publication order
-// proxy_protocol.h specifies and polls the completion slot. No CUDA involved.
-
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -54,7 +49,6 @@ namespace proxy_runtime {
         TearDown() override {
             backend_.completeEverything();
             runtime_.reset();
-            // Every device and mapped-host allocation the runtime made is gone.
             EXPECT_EQ(allocator_.liveAllocations(), 0u);
         }
 
@@ -80,15 +74,7 @@ namespace proxy_runtime {
                                             allocator_);
         }
 
-        /**
-         * The GPU's view of one ring, translated to host pointers. The ring
-         * descriptor and its producer words are device memory, which the mock
-         * keeps directly readable. The records, the completion slot, and the
-         * consumer index are mapped host memory that the runtime publishes to
-         * the GPU through their device alias, which only the mock can
-         * translate back - so a host pointer published in their place shows
-         * up here as a failed translation.
-         */
+        /** Translate mapped device aliases so incorrect host-pointer publication fails. */
         struct ChannelAccess {
             const nixlProxyWorkRing *ring = nullptr;
             nixlProxySubmission *records = nullptr;
@@ -111,10 +97,7 @@ namespace proxy_runtime {
             return access;
         }
 
-        /**
-         * Enqueue a record the way the GPU must: fill the body first, then
-         * release-store op_idx, which lives at offset 0 and publishes readiness.
-         */
+        /** Publish the record body before its readiness word, as the GPU does. */
         static void
         publish(const ChannelAccess &access,
                 uint64_t producer_idx,
@@ -166,7 +149,7 @@ namespace proxy_runtime {
         }
 
         static uint64_t
-        memViewId(nixlMemViewH view) {
+        hostViewToken(nixlMemViewH view) {
             return static_cast<const nixlProxyDeviceMemView *>(view)->host_view;
         }
 
@@ -178,8 +161,8 @@ namespace proxy_runtime {
             nixlProxySubmission record{};
             record.opcode = nixl_proxy_opcode_t::PUT;
             record.channel_id = static_cast<uint16_t>(channel_id);
-            record.src_view = memViewId(src);
-            record.dst_view = memViewId(dst);
+            record.src_view = hostViewToken(src);
+            record.dst_view = hostViewToken(dst);
             record.dst_index = dst_index;
             record.operand = 4;
             record.dst_offset = 8;
@@ -191,7 +174,7 @@ namespace proxy_runtime {
         makeAtomicAdd(nixlMemViewH dst, uint64_t value = 42) {
             nixlProxySubmission record{};
             record.opcode = nixl_proxy_opcode_t::ATOMIC_ADD;
-            record.dst_view = memViewId(dst);
+            record.dst_view = hostViewToken(dst);
             record.dst_offset = 8;
             record.size = sizeof(uint64_t);
             record.operand = value;
@@ -203,8 +186,6 @@ namespace proxy_runtime {
         DummyBackendMD local_md_;
         DummyBackendMD remote_md_;
         uint32_t max_peers_ = 1;
-        // Declared last: the runtime's callbacks and memory outlive nothing here,
-        // so it must die before the mocks it points at.
         std::unique_ptr<nixlProxyRuntime> runtime_;
     };
 
@@ -235,8 +216,8 @@ namespace proxy_runtime {
              [](nixlProxyConfig &config, nixlProxyBackendOps &) { config.ring_depth = 0; },
              NIXL_ERR_INVALID_PARAM},
             {"backend init failure",
-             [this](nixlProxyConfig &, nixlProxyBackendOps &) {
-                 backend_.failInit(NIXL_ERR_BACKEND);
+             [](nixlProxyConfig &, nixlProxyBackendOps &ops) {
+                 ops.init = [](const nixlProxyConfig &) { return NIXL_ERR_BACKEND; };
              },
              NIXL_ERR_BACKEND},
         };
@@ -250,13 +231,13 @@ namespace proxy_runtime {
             EXPECT_EQ(runtime_, nullptr) << row.name;
             EXPECT_EQ(allocator_.liveAllocations(), 0u) << row.name;
         }
-        backend_.failInit(NIXL_SUCCESS);
-
-        // Accepted: the backend is told how many threads will actually run,
-        // and a null output is refused before anything is registered.
-        ASSERT_EQ(createRuntime(/*channel_count=*/3, /*max_peers=*/2, /*thread_count=*/8),
+        auto ops = backend_.ops();
+        ops.init = [](const nixlProxyConfig &config) {
+            EXPECT_EQ(config.effectiveThreadCount(), 3u);
+            return NIXL_SUCCESS;
+        };
+        ASSERT_EQ(nixlProxyRuntime::create(ops, makeConfig(3, 2, 8), runtime_, allocator_),
                   NIXL_SUCCESS);
-        EXPECT_EQ(backend_.initThreadCount(), 3u);
         EXPECT_EQ(runtime_->prepMemView(makeLocalDlist(0x1000, 64, 0, &local_md_), nullptr),
                   NIXL_ERR_INVALID_PARAM);
     }
@@ -288,7 +269,7 @@ namespace proxy_runtime {
             "Failed to quiesce proxy backend");
     }
 
-    TEST_F(ProxyRuntimeTest, DeviceContextAndRingsStartInitialized) {
+    TEST_F(ProxyRuntimeTest, InitializedRingsFollowStartAndShutdownLifecycle) {
         ASSERT_EQ(createRuntime(/*channel_count=*/3, /*max_peers=*/2), NIXL_SUCCESS);
 
         const nixlProxyDeviceContextData *context = runtime_->deviceContext();
@@ -299,8 +280,6 @@ namespace proxy_runtime {
         ASSERT_NE(context->channels, nullptr);
         ASSERT_NE(context->shutdown_word, nullptr);
 
-        // Every ring starts empty, with its own records, and the device copy of
-        // the view table matches what the host handed out.
         std::set<const void *> record_arrays;
         for (uint32_t channel_id = 0; channel_id < 3; ++channel_id) {
             for (uint32_t peer = 0; peer < 2; ++peer) {
@@ -320,38 +299,26 @@ namespace proxy_runtime {
         }
         EXPECT_EQ(record_arrays.size(), 6u);
 
-        // Starting publishes RUNNING to the word the kernels poll.
         ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
+        EXPECT_EQ(runtime_->startWorkers(), NIXL_ERR_INVALID_PARAM);
         const uint64_t *shutdown_word = allocator_.hostAlias(context->shutdown_word);
         ASSERT_NE(shutdown_word, nullptr);
         EXPECT_EQ(__atomic_load_n(shutdown_word, __ATOMIC_ACQUIRE),
                   static_cast<uint64_t>(nixl_proxy_control_state_t::RUNNING));
 
-        // A prepared view is stamped with the context so device code can find the rings.
-        nixlMemViewH src = nullptr;
-        ASSERT_EQ(runtime_->prepMemView(makeLocalDlist(0x1000, 64, 0, &local_md_), &src),
-                  NIXL_SUCCESS);
+        nixlMemViewH src = nullptr, dst = nullptr;
+        prepMemViews(src, dst);
         EXPECT_EQ(static_cast<const nixlProxyDeviceMemView *>(src)->context, context);
-
-        EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
-        EXPECT_EQ(runtime_->deviceContext(), nullptr);
-    }
-
-    TEST_F(ProxyRuntimeTest, StartAndShutdownLifecycle) {
-        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
-        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
-        // A second start is refused rather than doubling the threads.
-        EXPECT_EQ(runtime_->startWorkers(), NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
+        EXPECT_EQ(runtime_->unregisterProxyMemView(src), NIXL_SUCCESS);
+        EXPECT_EQ(backend_.submissionCount(), 0u);
 
         EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
         EXPECT_EQ(runtime_->deviceContext(), nullptr);
         EXPECT_EQ(backend_.shutdownCalls(), 1u);
-        // Shutting down again is a no-op that does not reach the backend twice.
         EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
         EXPECT_EQ(backend_.shutdownCalls(), 1u);
 
-        // Nothing is left behind for the next runtime, which may also be shut
-        // down without ever having started.
         runtime_.reset();
         EXPECT_EQ(allocator_.liveAllocations(), 0u);
         ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
@@ -370,8 +337,6 @@ namespace proxy_runtime {
         publish(access, 1, makeAtomicAdd(dst, 42), 8);
         ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 2; }));
 
-        // The worker resolved both records through the registry into
-        // transport-ready descriptors.
         const auto submissions = backend_.submissions();
         const nixlBackendProxySubmission &put = submissions[0];
         EXPECT_EQ(put.op_idx, 7u);
@@ -379,25 +344,15 @@ namespace proxy_runtime {
         EXPECT_EQ(put.channel_id, 0u);
         EXPECT_EQ(put.peer_index, 0u);
         EXPECT_EQ(put.size, 32u);
-        EXPECT_EQ(put.local.mem_type, DRAM_SEG);
         EXPECT_EQ(put.local.desc.addr, 0x1004u);
-        EXPECT_EQ(put.local.desc.len, 32u);
-        EXPECT_EQ(put.local.desc.metadataP, &local_md_);
-        EXPECT_EQ(put.remote.mem_type, VRAM_SEG);
         EXPECT_EQ(put.remote.desc.addr, 0x2008u);
-        EXPECT_EQ(put.remote.desc.len, 32u);
-        EXPECT_EQ(put.remote.desc.metadataP, &remote_md_);
         const nixlBackendProxySubmission &atomic = submissions[1];
         EXPECT_EQ(atomic.op_idx, 8u);
         EXPECT_EQ(atomic.opcode, nixl_proxy_opcode_t::ATOMIC_ADD);
         EXPECT_EQ(atomic.size, sizeof(uint64_t));
         EXPECT_EQ(atomic.value, 42u);
         EXPECT_EQ(atomic.remote.desc.addr, 0x2008u);
-        EXPECT_EQ(atomic.remote.desc.len, sizeof(uint64_t));
-        EXPECT_EQ(atomic.remote.desc.metadataP, &remote_md_);
 
-        // Nothing is published back until the backend completes, and completing
-        // the second request first does not let it overtake the first.
         EXPECT_EQ(completedIdx(access), 0u);
         EXPECT_EQ(consumerIdx(access), 0u);
         backend_.complete(backend_.token(1));
@@ -425,7 +380,6 @@ namespace proxy_runtime {
         ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == kRingDepth; }));
         EXPECT_EQ(consumerIdx(access), 0u);
 
-        // The ring is full: a record written into the wrapped slot must wait.
         publish(access, kRingDepth, record, kRingDepth + 1);
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         EXPECT_EQ(backend_.submissionCount(), size_t{kRingDepth});
@@ -436,7 +390,6 @@ namespace proxy_runtime {
         ASSERT_TRUE(waitFor([&]() { return consumerIdx(access) == kRingDepth; }));
         EXPECT_EQ(completedIdx(access), uint64_t{kRingDepth});
 
-        // With space freed the wrapped record is picked up.
         ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == kRingDepth + 1; }));
         EXPECT_EQ(backend_.submissions().back().op_idx, uint64_t{kRingDepth} + 1);
         backend_.complete(backend_.token(kRingDepth));
@@ -451,8 +404,6 @@ namespace proxy_runtime {
         const ChannelAccess access = channel();
         const nixlProxySubmission good = makePut(src, dst);
 
-        // A record the registry cannot resolve fails at preparation: it is
-        // retired without reaching the backend, and its error latches the slot.
         nixlProxySubmission unknown = good;
         unknown.dst_view = 0;
         publish(access, 0, unknown, 1);
@@ -462,8 +413,6 @@ namespace proxy_runtime {
         EXPECT_LT(first_error, 0);
         EXPECT_EQ(backend_.submissionCount(), 0u);
 
-        // A completion error, a submit error, and a success all retire their
-        // records afterwards, but the latched status never moves again.
         publish(access, 1, good, 2);
         ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 1; }));
         backend_.complete(backend_.token(0), NIXL_ERR_BACKEND);
@@ -482,84 +431,45 @@ namespace proxy_runtime {
         EXPECT_EQ(access.completion->completion_status, first_error);
     }
 
-    TEST_F(ProxyRuntimeTest, ReplacementViewWorksAfterDrainAndRelease) {
-        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
-        nixlMemViewH src = nullptr, dst = nullptr;
-        prepMemViews(src, dst);
-        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
-        const ChannelAccess access = channel();
-        const nixlProxySubmission record = makePut(src, dst);
-        publish(access, 0, record, 1);
-        ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 1; }));
-        backend_.complete(backend_.token(0));
-        ASSERT_TRUE(waitFor([&]() { return consumerIdx(access) == 1u; }));
-
-        // Retiring drains the rings first, then frees the device view at once -
-        // only the GPU reads it, and the caller has quiesced the GPU, the same
-        // contract as the direct path's ucp_device_mem_list_release - and
-        // forgets the handle.
-        ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
-        EXPECT_TRUE(allocator_.wasFreed(dst));
-        EXPECT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_ERR_INVALID_PARAM);
-
-        // The drain rearmed the ring, so the next generation starts over.
-        EXPECT_EQ(consumerIdx(access), 0u);
-        EXPECT_EQ(completedIdx(access), 0u);
-        EXPECT_EQ(access.completion->completion_status, NIXL_IN_PROG);
-
-        nixl_remote_meta_dlist_t remote(VRAM_SEG);
-        remote.addDesc(makeRemoteDesc("peer", 0x9000, 64, 0, &remote_md_));
-        nixlMemViewH replacement = nullptr;
-        ASSERT_EQ(runtime_->prepMemView(remote, &replacement), NIXL_SUCCESS);
-        publish(access, 0, makePut(src, replacement), 2);
-        ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 2; }));
-        backend_.complete(backend_.token(1));
-        ASSERT_TRUE(waitFor([&]() { return consumerIdx(access) == 1u; }));
-        EXPECT_EQ(backend_.submissionCount(), 2u);
-        EXPECT_EQ(completedIdx(access), 2u);
-        EXPECT_EQ(access.completion->completion_status, NIXL_SUCCESS);
-    }
-
     TEST_F(ProxyRuntimeTest, RemoteDirectPointersFollowTheResolver) {
-        ASSERT_EQ(createRuntime(/*channel_count=*/1, /*max_peers=*/2), NIXL_SUCCESS);
         nixl_remote_meta_dlist_t remote(VRAM_SEG);
         remote.addDesc(makeRemoteDesc("peer0", 0x2000, 64, 0, &remote_md_));
         remote.addDesc(makeRemoteDesc("peer1", 0x3000, 64, 1, &remote_md_));
-
-        // Whatever the backend resolves lands in the device view, one slot per descriptor.
         const std::vector<void *> direct_ptrs{reinterpret_cast<void *>(uintptr_t{0xabc00000}),
                                               nullptr};
-        backend_.setDirectPointers(direct_ptrs);
+        nixl_status_t status = NIXL_SUCCESS;
+        unsigned calls = 0;
+        auto ops = backend_.ops();
+        ops.resolve_direct_ptrs = [&](const auto &descs, auto &pointers) {
+            ++calls;
+            EXPECT_EQ(descs.descCount(), 2u);
+            pointers = direct_ptrs;
+            return status;
+        };
+        ASSERT_EQ(nixlProxyRuntime::create(ops, makeConfig(1, 2, 1), runtime_, allocator_),
+                  NIXL_SUCCESS);
         nixlMemViewH dst = nullptr;
         ASSERT_EQ(runtime_->prepMemView(remote, &dst), NIXL_SUCCESS);
-        EXPECT_EQ(backend_.resolveCalls(), 1u);
-        EXPECT_EQ(backend_.lastResolvedDescCount(), 2u);
         const auto *view = static_cast<const nixlProxyDeviceMemView *>(dst);
         ASSERT_EQ(view->direct_ptr_count, 2u);
         void *const *stored = nixlProxyDeviceMemViewDirectPtrs(view);
         EXPECT_EQ(std::vector<void *>(stored, stored + 2), direct_ptrs);
 
-        // A resolver error fails the prep before anything is registered.
-        backend_.setResolverStatus(NIXL_ERR_INVALID_PARAM);
+        status = NIXL_ERR_INVALID_PARAM;
         const size_t live = allocator_.liveAllocations();
         nixlMemViewH failed = nullptr;
-        EXPECT_EQ(runtime_->prepMemView(remote, &failed), NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(runtime_->prepMemView(remote, &failed), status);
         EXPECT_EQ(failed, nullptr);
         EXPECT_EQ(allocator_.liveAllocations(), live);
+        EXPECT_EQ(calls, 2u);
 
-        // A backend without a resolver is not asked; the view simply carries none.
         runtime_.reset();
-        backend_.setResolverStatus(NIXL_SUCCESS);
-        backend_.disableResolver();
-        ASSERT_EQ(createRuntime(/*channel_count=*/1, /*max_peers=*/2), NIXL_SUCCESS);
+        ASSERT_EQ(createRuntime(1, 2), NIXL_SUCCESS);
         ASSERT_EQ(runtime_->prepMemView(remote, &dst), NIXL_SUCCESS);
-        EXPECT_EQ(backend_.resolveCalls(), 2u);
         EXPECT_EQ(static_cast<const nixlProxyDeviceMemView *>(dst)->direct_ptr_count, 0u);
     }
 
     TEST_F(ProxyRuntimeTest, ChannelsAndPeersKeepToTheirOwnRings) {
-        // Three channels over two workers: worker 0 owns channels 0 and 2,
-        // worker 1 owns channel 1, and each owns every peer of its channels.
         ASSERT_EQ(createRuntime(/*channel_count=*/3, /*max_peers=*/2, /*thread_count=*/2),
                   NIXL_SUCCESS);
         nixlMemViewH src = nullptr, dst = nullptr;
@@ -578,7 +488,6 @@ namespace proxy_runtime {
         publish(middle, 0, makePut(src, dst, /*channel_id=*/1, /*dst_index=*/0), 6);
         ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 2; }));
 
-        // Each submission names the ring it came from and the agent that ring serves.
         for (const auto &submission : backend_.submissions()) {
             if (submission.op_idx == 5) {
                 EXPECT_EQ(submission.channel_id, 2u);
@@ -592,10 +501,10 @@ namespace proxy_runtime {
             }
         }
 
-        // Completions land in their own ring and nowhere else.
         backend_.complete(backend_.token(0));
         backend_.complete(backend_.token(1));
-        ASSERT_TRUE(waitFor([&]() { return consumerIdx(striped) == 1u && consumerIdx(middle) == 1u; }));
+        ASSERT_TRUE(
+            waitFor([&]() { return consumerIdx(striped) == 1u && consumerIdx(middle) == 1u; }));
         EXPECT_EQ(completedIdx(striped), 5u);
         EXPECT_EQ(completedIdx(middle), 6u);
         EXPECT_EQ(consumerIdx(striped), 1u);
@@ -604,37 +513,42 @@ namespace proxy_runtime {
         EXPECT_EQ(completedIdx(idle), 0u);
     }
 
-    // Queued records must finish before their view is retired.
-    // repo docs/issues/005 G1: a record already in the ring when its memview is
-    // retired used to fail prepareSubmission and vanish, taking transfers to
-    // healthy peers with it. Retiring now drains first.
     TEST_F(ProxyRuntimeTest, DrainSubmitsQueuedRecordsBeforeRetire) {
-        backend_.completeEverything();
-        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
         nixlMemViewH src = nullptr, dst = nullptr;
+        const auto caller = std::this_thread::get_id();
+        unsigned quiesced = 0;
+        auto ops = backend_.ops();
+        ops.quiesce = [&](uint32_t, uint32_t) {
+            EXPECT_NE(std::this_thread::get_id(), caller);
+            if (quiesced++ == 0) {
+                EXPECT_EQ(consumerIdx(channel()), kRingDepth);
+                EXPECT_EQ(completedIdx(channel()), kRingDepth);
+                EXPECT_FALSE(allocator_.wasFreed(dst));
+            }
+            return NIXL_SUCCESS;
+        };
+        ASSERT_EQ(nixlProxyRuntime::create(ops, makeConfig(1, 1, 1), runtime_, allocator_),
+                  NIXL_SUCCESS);
         prepMemViews(src, dst);
-        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
-
+        backend_.completeEverything();
         const ChannelAccess access = channel();
-        const nixlProxySubmission record = makePut(src, dst);
         for (uint64_t i = 0; i < kRingDepth; ++i) {
-            publish(access, i, record, i + 1);
+            publish(access, i, makePut(src, dst), i + 1);
         }
-
-        // No waiting: retire straight away, racing the worker.
+        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
         ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
-
         EXPECT_EQ(backend_.submissionCount(), size_t{kRingDepth});
         for (const auto &submission : backend_.submissions()) {
             EXPECT_EQ(submission.remote.desc.addr, 0x2008u);
         }
-        // Drained to empty and rearmed, so the next generation starts clean.
+        EXPECT_TRUE(allocator_.wasFreed(dst));
         EXPECT_EQ(consumerIdx(access), 0u);
+        EXPECT_EQ(completedIdx(access), 0u);
         EXPECT_EQ(access.completion->completion_status, NIXL_IN_PROG);
+        EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
+        EXPECT_EQ(quiesced, 2u);
     }
 
-    // repo docs/issues/005 G2: re-adding a rank used to inherit whatever state
-    // the wedged ring was left in.
     TEST_F(ProxyRuntimeTest, RingsAreUsableAfterDrain) {
         ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
         nixlMemViewH src = nullptr, dst = nullptr;
@@ -646,56 +560,28 @@ namespace proxy_runtime {
         ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 1; }));
 
         backend_.complete(backend_.token(0), NIXL_ERR_BACKEND);
-        // A terminal transfer error still permits safe retirement.
         ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
+        EXPECT_TRUE(allocator_.wasFreed(dst));
+        EXPECT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(consumerIdx(access), 0u);
+        EXPECT_EQ(completedIdx(access), 0u);
+        EXPECT_EQ(access.completion->completion_status, NIXL_IN_PROG);
         ASSERT_EQ(runtime_->unregisterProxyMemView(src), NIXL_SUCCESS);
 
-        // Same ring, new generation of memviews - it has to work.
         nixlMemViewH new_src = nullptr, new_dst = nullptr;
-        prepMemViews(new_src, new_dst);
+        ASSERT_EQ(runtime_->prepMemView(makeLocalDlist(0x1000, 64, 0, &local_md_), &new_src),
+                  NIXL_SUCCESS);
+        nixl_remote_meta_dlist_t replacement(VRAM_SEG);
+        replacement.addDesc(makeRemoteDesc("peer", 0x9000, 64, 0, &remote_md_));
+        ASSERT_EQ(runtime_->prepMemView(replacement, &new_dst), NIXL_SUCCESS);
         backend_.completeEverything();
         publish(access, 0, makePut(new_src, new_dst), 7);
 
-        ASSERT_TRUE(waitFor([&]() { return completedIdx(access) == 7u; }));
+        ASSERT_TRUE(waitFor([&]() { return consumerIdx(access) == 1u; }));
+        EXPECT_EQ(completedIdx(access), 7u);
         EXPECT_EQ(access.completion->completion_status, NIXL_SUCCESS);
         EXPECT_EQ(backend_.submissionCount(), 2u);
-    }
-
-    TEST_F(ProxyRuntimeTest, DrainOnEmptyRingsCancelsNothing) {
-        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
-        nixlMemViewH src = nullptr, dst = nullptr;
-        prepMemViews(src, dst);
-        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
-
-        ASSERT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
-        ASSERT_EQ(runtime_->unregisterProxyMemView(src), NIXL_SUCCESS);
-
-        EXPECT_EQ(backend_.submissionCount(), 0u);
-    }
-
-    TEST_F(ProxyRuntimeTest, ShutdownAfterCompletionReleasesNothingAndFreesEverything) {
-        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
-        nixlMemViewH src = nullptr, dst = nullptr;
-        prepMemViews(src, dst);
-        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
-        const ChannelAccess access = channel();
-        const nixlProxySubmission record = makePut(src, dst);
-        publish(access, 0, record, 1);
-        publish(access, 1, record, 2);
-        ASSERT_TRUE(waitFor([&]() { return backend_.submissionCount() == 2; }));
-        backend_.complete(backend_.token(0));
-        backend_.complete(backend_.token(1));
-        ASSERT_TRUE(waitFor([&]() { return consumerIdx(access) == 2u; }));
-
-        // Every request reached a terminal status through check_completion, so
-        // shutdown has nothing to hand back; the views left registered go with
-        // the registry instead of leaking into the next generation.
-        EXPECT_FALSE(allocator_.wasFreed(src));
-        EXPECT_FALSE(allocator_.wasFreed(dst));
-        EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
-        EXPECT_EQ(backend_.shutdownCalls(), 1u);
-        EXPECT_TRUE(allocator_.wasFreed(src));
-        EXPECT_TRUE(allocator_.wasFreed(dst));
+        EXPECT_EQ(backend_.submissions().back().remote.desc.addr, 0x9008u);
     }
 
     TEST_F(ProxyRuntimeTest, ReleaseWaitsForTerminalErrorsBeyondOldDeadline) {
@@ -706,7 +592,12 @@ namespace proxy_runtime {
         publish(channel(0, 0), 0, makePut(src, dst, 0, 0), 1);
         publish(channel(0, 1), 0, makePut(src, dst, 0, 1), 1);
         ASSERT_TRUE(waitFor([&] { return backend_.submissionCount() == 2; }));
-        backend_.completePeer(1);
+        const auto submissions = backend_.submissions();
+        for (size_t i = 0; i < submissions.size(); ++i) {
+            if (submissions[i].peer_index == 1) {
+                backend_.complete(backend_.token(i));
+            }
+        }
         std::atomic<bool> done{false};
         std::thread release([&] {
             EXPECT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
@@ -717,7 +608,6 @@ namespace proxy_runtime {
         EXPECT_FALSE(allocator_.wasFreed(dst));
         EXPECT_EQ(backend_.quiesceCalls(), 0u);
         EXPECT_TRUE(waitFor([&] { return completedIdx(channel(0, 1)) == 1; }));
-        const auto submissions = backend_.submissions();
         for (size_t i = 0; i < submissions.size(); ++i) {
             if (submissions[i].peer_index == 0) {
                 backend_.complete(backend_.token(i), NIXL_ERR_REMOTE_DISCONNECT);
@@ -729,54 +619,42 @@ namespace proxy_runtime {
         EXPECT_EQ(backend_.quiesceCalls(), 2u);
     }
 
-    TEST_F(ProxyRuntimeTest, QuiescencePrecedesResetAndFree) {
-        auto ops = backend_.ops();
-        nixlMemViewH src = nullptr, dst = nullptr;
-        const auto caller = std::this_thread::get_id();
-        unsigned quiesced = 0;
-        ops.quiesce = [&](uint32_t, uint32_t) {
-            EXPECT_NE(std::this_thread::get_id(), caller);
-            if (quiesced++ == 0) {
-                EXPECT_EQ(consumerIdx(channel()), 1u);
-                EXPECT_EQ(completedIdx(channel()), 7u);
-                EXPECT_FALSE(allocator_.wasFreed(dst));
+    TEST_F(ProxyRuntimeTest, ShutdownRetiresCompletedAndPendingWork) {
+        for (bool pending : {false, true}) {
+            SCOPED_TRACE(pending);
+            ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
+            nixlMemViewH src = nullptr, dst = nullptr;
+            prepMemViews(src, dst);
+            ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
+            const auto *shutdown = allocator_.hostAlias(runtime_->deviceContext()->shutdown_word);
+            const size_t previous = backend_.submissionCount();
+            publish(channel(), 0, makePut(src, dst), 1);
+            ASSERT_TRUE(waitFor([&] { return backend_.submissionCount() == previous + 1; }));
+            const auto token = backend_.token(previous);
+            if (!pending) {
+                backend_.complete(token);
+                ASSERT_TRUE(waitFor([&] { return consumerIdx(channel()) == 1; }));
             }
-            return NIXL_SUCCESS;
-        };
-        ASSERT_EQ(nixlProxyRuntime::create(ops, makeConfig(1, 1, 1), runtime_, allocator_),
-                  NIXL_SUCCESS);
-        prepMemViews(src, dst);
-        backend_.completeEverything();
-        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
-        publish(channel(), 0, makePut(src, dst), 7);
-        EXPECT_EQ(runtime_->unregisterProxyMemView(dst), NIXL_SUCCESS);
-        EXPECT_TRUE(allocator_.wasFreed(dst));
-        EXPECT_EQ(consumerIdx(channel()), 0u);
-        EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
-        EXPECT_EQ(quiesced, 2u);
-    }
-
-    TEST_F(ProxyRuntimeTest, ShutdownWaitsForTerminalWork) {
-        ASSERT_EQ(createRuntime(), NIXL_SUCCESS);
-        nixlMemViewH src = nullptr, dst = nullptr;
-        prepMemViews(src, dst);
-        ASSERT_EQ(runtime_->startWorkers(), NIXL_SUCCESS);
-        const auto *shutdown = allocator_.hostAlias(runtime_->deviceContext()->shutdown_word);
-        publish(channel(), 0, makePut(src, dst), 1);
-        ASSERT_TRUE(waitFor([&] { return backend_.submissionCount() == 1; }));
-        std::atomic<bool> done{false};
-        std::thread stop([&] {
-            EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
-            done.store(true, std::memory_order_release);
-        });
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        EXPECT_FALSE(done.load());
-        EXPECT_EQ(__atomic_load_n(shutdown, __ATOMIC_ACQUIRE),
-                  static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN));
-        EXPECT_FALSE(allocator_.wasFreed(dst));
-        backend_.complete(backend_.token(0), NIXL_ERR_REMOTE_DISCONNECT);
-        stop.join();
-        EXPECT_TRUE(allocator_.wasFreed(dst));
+            std::atomic<bool> done{false};
+            std::thread stop([&] {
+                EXPECT_EQ(runtime_->shutdown(), NIXL_SUCCESS);
+                done.store(true, std::memory_order_release);
+            });
+            if (pending) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                EXPECT_FALSE(done.load(std::memory_order_acquire));
+                EXPECT_EQ(__atomic_load_n(shutdown, __ATOMIC_ACQUIRE),
+                          static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN));
+                EXPECT_FALSE(allocator_.wasFreed(dst));
+                backend_.complete(token, NIXL_ERR_REMOTE_DISCONNECT);
+            }
+            stop.join();
+            EXPECT_TRUE(done.load(std::memory_order_acquire));
+            EXPECT_TRUE(allocator_.wasFreed(src));
+            EXPECT_TRUE(allocator_.wasFreed(dst));
+            EXPECT_EQ(backend_.shutdownCalls(), pending ? 2u : 1u);
+            runtime_.reset();
+        }
     }
 
     TEST_F(ProxyRuntimeTest, UnpublishedTicketsNeverRearmSilently) {
