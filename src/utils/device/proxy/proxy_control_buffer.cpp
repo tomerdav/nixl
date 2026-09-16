@@ -114,7 +114,7 @@ nixlProxyControlBuffer::allocateGdrCopy(nixlDeviceAllocator &allocator, size_t c
         return NIXL_ERR_BACKEND;
     }
 
-    const uintptr_t allocation_addr = reinterpret_cast<uintptr_t>(mapping->allocation.get());
+    const uintptr_t allocation_addr = reinterpret_cast<uintptr_t>(mapping->allocation.devicePointer());
     const uintptr_t aligned_addr =
         (allocation_addr + GPU_PAGE_SIZE - 1) & ~(static_cast<uintptr_t>(GPU_PAGE_SIZE) - 1);
     auto *slots = reinterpret_cast<uint64_t *>(aligned_addr);
