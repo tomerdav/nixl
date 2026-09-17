@@ -66,7 +66,7 @@ namespace proxy_mocks {
                 return NIXL_ERR_INVALID_PARAM;
             }
             std::memset(resolve(ptr), value, size);
-            return NIXL_SUCCESS;
+                        return NIXL_SUCCESS;
         }
 
         nixl_status_t
