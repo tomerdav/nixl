@@ -81,6 +81,9 @@ public:
     assert(sharedState > 0);
     return gmock_backend_engine->getPublicData(meta, str);
   }
+  void releaseMemView(nixlMemViewH mvh) const override {
+      gmock_backend_engine->releaseMemView(mvh);
+  }
   nixl_status_t getConnInfo(std::string &str) const override {
     assert(sharedState > 0);
     return gmock_backend_engine->getConnInfo(str);
