@@ -40,6 +40,10 @@ proxyChannelState::allocate(deviceOps &allocator,
     ring_depth_ = depth;
     control_slots_ = control_slots;
     allocator_ = &allocator;
+    if (allocator.getActiveDevice(device_id_) != NIXL_SUCCESS) {
+        deallocate();
+        return NIXL_ERR_BACKEND;
+    }
     control_slot_index_ = control_slot_index;
     consumer_idx_dev_ = control_slots_->devicePointer(control_slot_index_);
     consumer_idx_shadow_ = 0;
