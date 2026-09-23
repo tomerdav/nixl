@@ -35,6 +35,11 @@
 #endif
 
 namespace {
+nixl_status_t
+worker_fence(ucp_worker_h worker) {
+    return nixl::ucx::ucsToNixlStatus(ucp_worker_fence(worker));
+}
+
 [[nodiscard]] bool
 sglEnabledFromConfig() {
     const bool enabled = nixl::config::getValueDefaulted("NIXL_UCX_SGL_ENABLE", false);
@@ -381,6 +386,87 @@ nixl_status_t nixlUcxEngine::prepXfer (const nixl_xfer_op_t &operation,
     return NIXL_SUCCESS;
 }
 
+nixl_status_t
+nixlUcxEngine::submitProxyRmaWrite(const nixlMetaDesc &local,
+                                   const nixlMetaDesc &remote,
+                                   size_t size,
+                                   size_t worker_id,
+                                   nixlUcxReq &req) const {
+    req = nullptr;
+
+    if (local.len != size || remote.len != size) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (worker_id >= getSharedWorkersSize()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    auto *lmd = static_cast<nixlUcxPrivateMetadata *>(local.metadataP);
+    auto *rmd = static_cast<nixlUcxPublicMetadata *>(remote.metadataP);
+    if (lmd == nullptr || rmd == nullptr || rmd->conn == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    auto &ep = rmd->conn->getEp(worker_id);
+    return ep->write(reinterpret_cast<void *>(local.addr),
+                     lmd->mem,
+                     static_cast<uint64_t>(remote.addr),
+                     rmd->getRkey(worker_id),
+                     size,
+                     req);
+}
+
+nixl_status_t
+nixlUcxEngine::submitProxyAtomicAdd(const nixlMetaDesc &remote,
+                                    uint64_t value,
+                                    size_t worker_id,
+                                    nixlUcxReq &req) const {
+    req = nullptr;
+
+    if (remote.len != sizeof(uint64_t)) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (worker_id >= getSharedWorkersSize()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    auto *rmd = static_cast<nixlUcxPublicMetadata *>(remote.metadataP);
+    if (rmd == nullptr || rmd->conn == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    // Order the counter update after the puts already posted on this worker:
+    // the receiver treats the counter as the signal that the data has landed.
+    const auto status = worker_fence(getSharedWorker(worker_id)->get());
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    auto &ep = rmd->conn->getEp(worker_id);
+    return ep->atomicAdd(value, static_cast<uint64_t>(remote.addr), rmd->getRkey(worker_id), req);
+}
+
+nixl_status_t
+nixlUcxEngine::checkProxyRequest(nixlUcxReq req) const {
+    return nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
+}
+
+void
+nixlUcxEngine::releaseProxyRequest(size_t worker_id, nixlUcxReq req) const {
+    if (req == nullptr) {
+        return;
+    }
+    if (worker_id >= getSharedWorkersSize()) {
+        NIXL_WARN << "nixlUcxEngine::releaseProxyRequest: invalid worker_id=" << worker_id;
+        return;
+    }
+
+    // The caller has observed terminal completion.
+    getSharedWorker(worker_id)->reqRelease(req);
+}
+
 nixl_status_t nixlUcxEngine::estimateXferCost (const nixl_xfer_op_t &operation,
                                                const nixl_meta_dlist_t &local,
                                                const nixl_meta_dlist_t &remote,
@@ -660,6 +746,11 @@ nixlUcxEngine::progress() {
     return ret;
 }
 
+unsigned
+nixlUcxEngine::progress(size_t worker_id) {
+    return getSharedWorker(worker_id)->progress();
+}
+
 void
 nixlUcxEngine::progressLoop() {
     while (progress() != 0)
@@ -772,6 +863,7 @@ nixlUcxEngine::genNotif(const std::string &remote_agent, const std::string &msg)
     return ret;
 }
 
+#ifdef HAVE_NIXL_DEVICE_API
 nixl_status_t
 nixlUcxEngine::prepMemView(const nixl_remote_meta_dlist_t &dlist,
                            nixlMemViewH &mvh,
@@ -786,7 +878,6 @@ nixlUcxEngine::prepMemView(const nixl_meta_dlist_t &dlist,
     return prepMemViewImpl(dlist, mvh, opt_args, "local");
 }
 
-#ifdef HAVE_NIXL_DEVICE_API
 template<typename DlistT>
 nixl_status_t
 nixlUcxEngine::prepMemViewImpl(const DlistT &dlist,
@@ -831,12 +922,18 @@ nixlUcxEngine::releaseMemView(nixlMemViewH mem_view) const {
     nixlDeviceMemViewFree(mem_view);
 }
 #else
-template<typename DlistT>
 nixl_status_t
-nixlUcxEngine::prepMemViewImpl(const DlistT &,
-                               nixlMemViewH &,
-                               const nixl_opt_b_args_t *,
-                               const char *) const {
+nixlUcxEngine::prepMemView(const nixl_remote_meta_dlist_t &,
+                           nixlMemViewH &,
+                           const nixl_opt_b_args_t *) const {
+    NIXL_ERROR << "The GPU Device API requires a CUDA-enabled NIXL build";
+    return NIXL_ERR_NOT_SUPPORTED;
+}
+
+nixl_status_t
+nixlUcxEngine::prepMemView(const nixl_meta_dlist_t &,
+                           nixlMemViewH &,
+                           const nixl_opt_b_args_t *) const {
     NIXL_ERROR << "The GPU Device API requires a CUDA-enabled NIXL build";
     return NIXL_ERR_NOT_SUPPORTED;
 }
