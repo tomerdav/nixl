@@ -134,8 +134,17 @@ nixlUcxEp::closeImpl() {
         NIXL_ASSERT(eph == nullptr);
         return NIXL_SUCCESS;
     case nixl::ucx::ep_state_t::FAILED: {
-        ucs_status_ptr_t request = ucpEpClose(eph, UCP_EP_CLOSE_FLAG_FORCE);
-        if (UCS_PTR_IS_PTR(request)) {
+        // Forcing a close is only legal when error handling is enabled: under
+        // err-mode none UCP rejects the flag outright and hands back an error
+        // pointer, which used to be discarded here and leak the ucp_ep. A
+        // failed endpoint has already had its lanes discarded, so a graceful
+        // close of one completes immediately anyway.
+        ucs_status_ptr_t request =
+            ucpEpClose(eph, errorHandlingEnabled() ? UCP_EP_CLOSE_FLAG_FORCE : 0u);
+        if (UCS_PTR_IS_ERR(request)) {
+            NIXL_ERROR << "Failed to close failed ep " << eph << ": "
+                       << ucs_status_string(UCS_PTR_STATUS(request));
+        } else if (UCS_PTR_IS_PTR(request)) {
             ucp_request_free(request);
         }
         eph = nullptr;
@@ -162,7 +171,8 @@ nixlUcxEp::closeImpl() {
     std::terminate();
 }
 
-nixlUcxEp::nixlUcxEp(ucp_worker_h worker, void *addr, ucp_err_handling_mode_t err_handling_mode) {
+nixlUcxEp::nixlUcxEp(ucp_worker_h worker, void *addr, ucp_err_handling_mode_t err_handling_mode)
+    : errHandlingMode_{err_handling_mode} {
     ucp_ep_params_t ep_params;
     nixl_status_t status;
 
@@ -314,6 +324,33 @@ nixlUcxEp::write(void *laddr,
         return NIXL_IN_PROG;
     }
 
+    return nixl::ucx::ucsToNixlStatus(UCS_PTR_STATUS(request));
+}
+
+nixl_status_t
+nixlUcxEp::atomicAdd(uint64_t value,
+                     uint64_t raddr,
+                     const nixl::ucx::rkey &rkey,
+                     nixlUcxReq &req) {
+    nixl_status_t status = checkTxState();
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    ucp_request_param_t param = {
+        .op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE,
+        .datatype = ucp_dt_make_contig(sizeof(uint64_t)),
+    };
+
+    const ucs_status_ptr_t request =
+        ucp_atomic_op_nbx(eph, UCP_ATOMIC_OP_ADD, &value, 1, raddr, rkey.get(), &param);
+    if (UCS_PTR_IS_PTR(request)) {
+        req = static_cast<nixlUcxReq>(request);
+        return NIXL_IN_PROG;
+    }
+
+    // A post-mode atomic that completes inside ucp_atomic_op_nbx hands back no
+    // handle, so there is nothing for the caller to track or release.
     return nixl::ucx::ucsToNixlStatus(UCS_PTR_STATUS(request));
 }
 

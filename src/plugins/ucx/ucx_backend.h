@@ -21,6 +21,7 @@
 #include <span>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <poll.h>
@@ -84,6 +85,11 @@ public:
 private:
     const std::vector<nixl::ucx::rkey> rkeys_;
 };
+
+namespace nixl {
+class proxyRuntime;
+struct proxyConfig;
+} // namespace nixl
 
 class nixlUcxEngine : public nixlBackendEngine {
 public:
@@ -176,6 +182,10 @@ public:
     unsigned
     progress();
 
+    /** Progress a single shared worker; the proxy drives one per ring. */
+    unsigned
+    progress(size_t worker_id);
+
     void
     progressLoop();
 
@@ -195,6 +205,57 @@ public:
                 const nixl_opt_b_args_t * = nullptr) const override;
 
     void releaseMemView(nixlMemViewH) const override;
+
+private:
+    /** Post one proxy put on the endpoint that reaches the submission's peer. */
+    nixl_status_t
+    submitProxyRmaWrite(const nixlMetaDesc &local,
+                        const nixlMetaDesc &remote,
+                        size_t size,
+                        size_t worker_id,
+                        nixlUcxReq &req) const;
+
+    nixl_status_t
+    submitProxyAtomicAdd(const nixlMetaDesc &remote,
+                         uint64_t value,
+                         size_t worker_id,
+                         nixlUcxReq &req) const;
+
+    nixl_status_t
+    checkProxyRequest(nixlUcxReq req) const;
+
+    /**
+     * Drop the proxy's bookkeeping for a request. This does NOT abort the
+     * operation: under err-mode none, which the proxy requires, UCX offers no
+     * way to abort an in-flight put. The NIC may keep reading the source
+     * buffer and land the write remotely until the transport reports the
+     * failure - so the memory behind a released operation must stay mapped
+     * until the endpoint is torn down.
+     */
+    void
+    releaseProxyRequest(size_t worker_id, nixlUcxReq req) const;
+
+#ifdef HAVE_NIXL_DEVICE_API
+    /**
+     * Create and start the engine-owned proxy runtime. Called as the last
+     * step of create(); worker threads call back into the engine, so it must
+     * be fully constructed first.
+     */
+    [[nodiscard]] nixl_status_t
+    setupProxyRuntime(const nixl::proxyConfig &config);
+
+    /** Wrap a backend memview into the device-dispatch handle; cleans up on failure. */
+    [[nodiscard]] nixl_status_t
+    wrapMemView(nixlMemViewH backend_mvh, nixlMemViewH &mvh) const;
+
+    /** Shared by the local and remote prepMemView overloads; kind names which. */
+    template<typename DlistT>
+    nixl_status_t
+    prepMemViewImpl(const DlistT &dlist,
+                    nixlMemViewH &mvh,
+                    const nixl_opt_b_args_t *opt_args,
+                    const char *kind) const;
+#endif
 
 protected:
     using worker_span_t = std::span<const std::unique_ptr<nixlUcxWorker>>;
@@ -295,8 +356,15 @@ private:
     mutable std::atomic<size_t> sharedWorkerIndex_;
     const bool sglEnabled_;
 
+    std::mutex baseNotifMutex_;
+
     // Map of agent name to saved nixlUcxConnection info
     std::unordered_map<std::string, ucx_connection_ptr_t> remoteConnMap;
+
+#ifdef HAVE_NIXL_DEVICE_API
+    /* Engine-owned device proxy (enabled via the device_proxy backend param). */
+    std::unique_ptr<nixl::proxyRuntime> proxyRuntime_;
+#endif
 };
 
 #endif

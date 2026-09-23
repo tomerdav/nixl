@@ -50,10 +50,9 @@ if sanitizer_opts.contains('thread')
 endif
 
 subdir('mocks')
-subdir('unit')
 subdir('plugins')
 
-if ucx_gpu_device_api_available
+if cuda_dep.found()
     subdir('device_api')
 endif
 
@@ -86,6 +85,8 @@ elif cuda_dep.found()
     cpp_flags += ['-DHAVE_GPU', '-DHAVE_CUDA']
 endif
 
+subdir('unit')
+
 if enabled_plugins.get('LIBFABRIC') and libfabric_dep.found()
     cpp_flags += '-DHAVE_LIBFABRIC'
 endif
@@ -116,16 +117,25 @@ gtest_sources = [
     'telemetry_stress_test.cpp',
     'telemetry_benchmark.cpp',
     'nixl_duration_test.cpp',
+    'blocking_queue_test.cpp',
     'configuration.cpp'
     ]
 
-if ucx_gpu_device_api_available
-    gtest_sources += device_api_test_sources
-    device_api_inc = [nixl_device_inc_dirs, include_directories('device_api')]
-    device_api_dep = [ucx_dep, doca_gpunetio_dep]
+if cuda_dep.found()
+    gtest_sources += proxy_device_api_test_sources
+    device_api_inc = nixl_device_api_inc_dirs + [include_directories('device_api')]
+    device_api_dep = [device_proxy_interface]
 else
     device_api_inc = []
     device_api_dep = []
+endif
+
+if cuda_dep.found() and ucx_dep.found() and is_variable('ucx_backend_interface')
+    gtest_sources += ucx_device_api_test_sources
+    device_api_dep += [ucx_dep]
+    if ucx_gpu_device_api_available
+        device_api_dep += [doca_gpunetio_dep]
+    endif
 endif
 
 if ucx_dep.found() and is_variable('ucx_backend_interface')
