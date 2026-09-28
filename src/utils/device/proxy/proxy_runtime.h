@@ -68,6 +68,7 @@ struct alignas(64) proxyChannelState {
     proxyControlBuffer *control_slots_ = nullptr;
     /** Remembered from allocate() so rearm() needs no arguments. */
     deviceOps *allocator_ = nullptr;
+    int device_id_ = 0;
     size_t control_slot_index_ = 0;
     /** Host-side ring depth for the CPU worker; nixlProxyWorkRing itself is device-only. */
     uint32_t ring_depth_ = 0;

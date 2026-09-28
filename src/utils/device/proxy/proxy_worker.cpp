@@ -127,6 +127,9 @@ proxyWorker::drainOwnedChannels() {
         if (!channel.allocated()) {
             return;
         }
+        if (channel.allocator_->setActiveDevice(channel.device_id_) != NIXL_SUCCESS) {
+            NIXL_FATAL << "Failed to select proxy ring device";
+        }
         channel.verifyDrained();
         if (backend_ops_->quiesce(channel_id, peer) != NIXL_SUCCESS) {
             NIXL_FATAL << "Failed to quiesce proxy backend";
