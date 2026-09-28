@@ -28,3 +28,5 @@ if cuda_dep.found()
                dependencies: [cuda_dep, nixl_common_dep],
                install: true)
 endif
+
+subdir('proxy')
