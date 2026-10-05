@@ -14,18 +14,35 @@ source "$here/ab-env.sh"
 source "$EP_KIT/env-dfw.sh"
 
 declare -A flags=([runtime]="" [fixdirect]="-DNIXL_DEVICE_FIXED_EXEC_MODE=1" [fixproxy]="-DNIXL_DEVICE_FIXED_EXEC_MODE=2")
+
+# Extract once: file creation on Lustre is slow, and the subprojects' docs are most of the files.
+shared=$AB_DIR/src
+if [ ! -e "$shared/.extracted" ]; then
+    rm -rf "$shared"
+    mkdir -p "$shared"
+    echo "=== extracting $src_tar"
+    tar -xf "$src_tar" -C "$shared" --exclude=./subprojects/asio-1.30.2/doc \
+        --exclude=./subprojects/taskflow/docs --exclude=./subprojects/taskflow/doxygen
+    touch "$shared/.extracted"
+fi
+
 for v in runtime fixdirect fixproxy; do
     root=$AB_DIR/$v
-    mkdir -p "$root"
+    # A variant's source/ is symlinks into the shared tree plus its own build/, the layout env.sh and
+    # run_node.sh expect. Move aside a real tree left by an earlier layout.
+    [ -d "$root/source" ] && [ ! -L "$root/source/src" ] && mv "$root/source" "$AB_DIR/old-$v-$$"
+    mkdir -p "$root/source"
+    for e in "$shared"/*; do
+        ln -sfn "$e" "$root/source/$(basename "$e")"
+    done
     cd "$root"
-    [ -d source ] || { mkdir source && tar -xf "$src_tar" -C source; }
     sed -e "s#@ROOT@#$root#g" -e "s#@VENV@#$EP_VENV#g" "$EP_KIT/ep-native.ini.in" > ep-native.ini
     sed -e "s#@ROOT@#$root#g" -e "s#@VENV@#$EP_VENV#g" "$EP_KIT/pybind11-config.in" > pybind11-config
     chmod +x pybind11-config
     cd source
     [ -d build ] && reconf=--reconfigure || reconf=
     echo "=== $v: cuda_args='${flags[$v]}'"
-    PATH=$EP_VENV/bin:$CUDA_HOME/bin:$PATH meson setup $reconf build --native-file="$root/ep-native.ini" \
+    PATH=$EP_VENV/bin:$CUDA_HOME/bin:$PATH meson setup $reconf build "$shared" --native-file="$root/ep-native.ini" \
         --wrap-mode=nodownload -Ducx_path="$EP_UCX" -Dbuild_examples=true -Dbuild_nixl_ep=true \
         -Dbuild_tests=false -Dnixl_cuda_arch_list="$NIXL_CUDA_ARCH" -Dbuildtype=release \
         -Ddisable_plugins=GPUNETIO -Dcuda_args="${flags[$v]}"
