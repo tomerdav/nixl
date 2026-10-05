@@ -122,14 +122,15 @@ public:
 };
 
 struct DummyProxyMemViews {
+    nixl::deviceOps &ops;
     nixlMemViewH src = nullptr;
     nixlMemViewH dst = nullptr;
 
-    explicit DummyProxyMemViews(nixl::proxyRuntime &runtime, uint32_t peer_count = 1);
+    DummyProxyMemViews(nixl::deviceOps &ops, nixl::proxyRuntime &runtime, uint32_t peer_count = 1);
 
     ~DummyProxyMemViews() {
-        nixlDeviceMemViewFree(src);
-        nixlDeviceMemViewFree(dst);
+        nixlDeviceMemViewFree(ops, src);
+        nixlDeviceMemViewFree(ops, dst);
     }
 
     DummyProxyMemViews(const DummyProxyMemViews &) = delete;
@@ -137,7 +138,10 @@ struct DummyProxyMemViews {
     operator=(const DummyProxyMemViews &) = delete;
 };
 
-DummyProxyMemViews::DummyProxyMemViews(nixl::proxyRuntime &runtime, uint32_t peer_count) {
+DummyProxyMemViews::DummyProxyMemViews(nixl::deviceOps &ops,
+                                       nixl::proxyRuntime &runtime,
+                                       uint32_t peer_count)
+    : ops(ops) {
     static DummyBackendMD local_md;
     static DummyBackendMD remote_md;
 
@@ -158,9 +162,9 @@ DummyProxyMemViews::DummyProxyMemViews(nixl::proxyRuntime &runtime, uint32_t pee
     }
     EXPECT_EQ(runtime.prepMemView(remote_dlist, &dst_raw), NIXL_SUCCESS);
 
-    EXPECT_EQ(nixlDeviceMemViewAllocate(nixl_device_exec_mode_t::PROXY, src_raw, src),
+    EXPECT_EQ(nixlDeviceMemViewAllocate(ops, nixl_device_exec_mode_t::PROXY, src_raw, src),
               NIXL_SUCCESS);
-    EXPECT_EQ(nixlDeviceMemViewAllocate(nixl_device_exec_mode_t::PROXY, dst_raw, dst),
+    EXPECT_EQ(nixlDeviceMemViewAllocate(ops, nixl_device_exec_mode_t::PROXY, dst_raw, dst),
               NIXL_SUCCESS);
 }
 
@@ -223,6 +227,8 @@ protected:
             GTEST_SKIP() << "No CUDA-capable GPU, skipping proxy device API test.";
         }
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ops_ = nixl::getDeviceOps();
+        ASSERT_NE(ops_, nullptr);
     }
 
     template<typename T>
@@ -237,12 +243,7 @@ protected:
     T *
     deviceAlloc(size_t count = 1) {
         allocations_.emplace_back();
-        auto *ops = nixl::getDeviceOps();
-        EXPECT_NE(ops, nullptr);
-        if (ops == nullptr) {
-            return nullptr;
-        }
-        EXPECT_EQ(ops->allocDeviceMem(sizeof(T) * count, allocations_.back()), NIXL_SUCCESS);
+        EXPECT_EQ(ops_->allocDeviceMem(sizeof(T) * count, allocations_.back()), NIXL_SUCCESS);
         EXPECT_EQ(cudaMemset(allocations_.back().get(), 0, sizeof(T) * count), cudaSuccess);
         return static_cast<T *>(allocations_.back().get());
     }
@@ -267,6 +268,8 @@ protected:
         return predicate();
     }
 
+    nixl::deviceOps *ops_ = nullptr;
+
 private:
     std::vector<nixl::deviceMem> allocations_;
 };
@@ -279,8 +282,7 @@ proxyTokenLayoutKernel(nixlProxyDeviceMemView *view, uint64_t *out) {
 }
 
 TEST_F(ProxyDeviceApiTest, TokenLayoutAndGetPtr) {
-    auto *allocator = nixl::getDeviceOps();
-    ASSERT_NE(allocator, nullptr);
+    auto *allocator = ops_;
     nixl::deviceMem context_mem, view_mem, output;
     ASSERT_EQ(allocator->allocDeviceMem(sizeof(nixlProxyDeviceContextData), context_mem),
               NIXL_SUCCESS);
@@ -319,10 +321,10 @@ TEST_F(ProxyDeviceApiTest, TokenLayoutAndGetPtr) {
 TEST_F(ProxyDeviceApiTest, ImmediatePutAndAtomicCompletionRoundTrip) {
     std::unique_ptr<nixl::proxyRuntime> runtime;
     ASSERT_EQ(nixl::proxyRuntime::create(
-                  std::make_unique<ImmediateTransport>(), makeProxyConfig(1, 1, 1), runtime),
+                  std::make_unique<ImmediateTransport>(), makeProxyConfig(1, 1, 1), runtime, *ops_),
               NIXL_SUCCESS);
     ASSERT_EQ(runtime->startWorkers(), NIXL_SUCCESS);
-    const DummyProxyMemViews views(*runtime);
+    const DummyProxyMemViews views(*ops_, *runtime);
     auto *result = deviceAlloc<DeviceResult>();
     for (bool atomic : {false, true}) {
         SCOPED_TRACE(atomic ? "atomic" : "put");
@@ -339,10 +341,11 @@ TEST_F(ProxyDeviceApiTest, PutPutAtomicAddCompletionFrontier) {
     auto transport = std::make_unique<ControllableBackend>();
     ControllableBackend &backend = *transport;
     std::unique_ptr<nixl::proxyRuntime> runtime;
-    ASSERT_EQ(nixl::proxyRuntime::create(std::move(transport), makeProxyConfig(1, 1, 1), runtime),
-              NIXL_SUCCESS);
+    ASSERT_EQ(
+        nixl::proxyRuntime::create(std::move(transport), makeProxyConfig(1, 1, 1), runtime, *ops_),
+        NIXL_SUCCESS);
     ASSERT_EQ(runtime->startWorkers(), NIXL_SUCCESS);
-    const DummyProxyMemViews views(*runtime);
+    const DummyProxyMemViews views(*ops_, *runtime);
     const auto ring = deviceGet(runtime->deviceChannelViews()[0].work_ring);
     auto *results = deviceAlloc<DeviceResult>(3);
     for (int i = 0; i < 3; ++i) {
@@ -376,10 +379,11 @@ TEST_F(ProxyDeviceApiTest, EarlierCompletionStaysSuccessfulAfterLaterError) {
     auto transport = std::make_unique<ControllableBackend>();
     ControllableBackend &backend = *transport;
     std::unique_ptr<nixl::proxyRuntime> runtime;
-    ASSERT_EQ(nixl::proxyRuntime::create(std::move(transport), makeProxyConfig(1, 1, 1), runtime),
-              NIXL_SUCCESS);
+    ASSERT_EQ(
+        nixl::proxyRuntime::create(std::move(transport), makeProxyConfig(1, 1, 1), runtime, *ops_),
+        NIXL_SUCCESS);
     ASSERT_EQ(runtime->startWorkers(), NIXL_SUCCESS);
-    const DummyProxyMemViews views(*runtime);
+    const DummyProxyMemViews views(*ops_, *runtime);
     auto *results = deviceAlloc<DeviceResult>(2);
     for (int i = 0; i < 2; ++i) {
         submitKernel<<<1, 1>>>(views.src, views.dst, results + i);
@@ -424,10 +428,11 @@ TEST_F(ProxyDeviceApiTest, SubmitFailurePropagatesErrorStatus) {
     std::unique_ptr<nixl::proxyRuntime> runtime;
     ASSERT_EQ(nixl::proxyRuntime::create(std::make_unique<FailingTransport>(submits, checks),
                                          makeProxyConfig(1, 1, 1),
-                                         runtime),
+                                         runtime,
+                                         *ops_),
               NIXL_SUCCESS);
     ASSERT_EQ(runtime->startWorkers(), NIXL_SUCCESS);
-    const DummyProxyMemViews views(*runtime);
+    const DummyProxyMemViews views(*ops_, *runtime);
     auto *result = deviceAlloc<DeviceResult>();
     submitKernel<<<1, 1>>>(views.src, views.dst, result);
     pollKernel<<<1, 1>>>(result, true);
@@ -442,10 +447,10 @@ TEST_F(ProxyDeviceApiTest, SubmitFailurePropagatesErrorStatus) {
 TEST_F(ProxyDeviceApiTest, RingSlotsAreReusedAfterWraparound) {
     std::unique_ptr<nixl::proxyRuntime> runtime;
     ASSERT_EQ(nixl::proxyRuntime::create(
-                  std::make_unique<ImmediateTransport>(), makeProxyConfig(1, 1, 1), runtime),
+                  std::make_unique<ImmediateTransport>(), makeProxyConfig(1, 1, 1), runtime, *ops_),
               NIXL_SUCCESS);
     ASSERT_EQ(runtime->startWorkers(), NIXL_SUCCESS);
-    const DummyProxyMemViews views(*runtime);
+    const DummyProxyMemViews views(*ops_, *runtime);
     constexpr uint32_t count = nixl::kDefaultProxyRingDepth + 3;
     auto *results = deviceAlloc<DeviceResult>(count);
     putLoopKernel<<<1, 1>>>(views.src, views.dst, count, results);
@@ -467,9 +472,9 @@ TEST_F(ProxyDeviceApiTest, RingSlotsAreReusedAfterWraparound) {
 TEST_F(ProxyDeviceApiTest, FullRingResumesWhenWorkersStart) {
     std::unique_ptr<nixl::proxyRuntime> runtime;
     ASSERT_EQ(nixl::proxyRuntime::create(
-                  std::make_unique<ImmediateTransport>(), makeProxyConfig(1, 1, 1), runtime),
+                  std::make_unique<ImmediateTransport>(), makeProxyConfig(1, 1, 1), runtime, *ops_),
               NIXL_SUCCESS);
-    const DummyProxyMemViews views(*runtime);
+    const DummyProxyMemViews views(*ops_, *runtime);
     constexpr uint32_t count = nixl::kDefaultProxyRingDepth + 1;
     auto *statuses = deviceAlloc<nixl_status_t>(count);
     putBurstKernel<<<1, 1>>>(views.src, views.dst, count, statuses);
@@ -491,10 +496,11 @@ TEST_F(ProxyDeviceApiTest, PeerAndChannelRoutingKeepsCompletionsIndependent) {
     auto transport = std::make_unique<ControllableBackend>();
     ControllableBackend &backend = *transport;
     std::unique_ptr<nixl::proxyRuntime> runtime;
-    ASSERT_EQ(nixl::proxyRuntime::create(std::move(transport), makeProxyConfig(2, 2, 2), runtime),
-              NIXL_SUCCESS);
+    ASSERT_EQ(
+        nixl::proxyRuntime::create(std::move(transport), makeProxyConfig(2, 2, 2), runtime, *ops_),
+        NIXL_SUCCESS);
     ASSERT_EQ(runtime->startWorkers(), NIXL_SUCCESS);
-    const DummyProxyMemViews views(*runtime, 2);
+    const DummyProxyMemViews views(*ops_, *runtime, 2);
     auto *results = deviceAlloc<DeviceResult>(2);
     submitKernel<<<1, 1>>>(views.src, views.dst, results, false, 2);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
