@@ -19,7 +19,9 @@ case "${1:?run|collect}" in
         out=$(mktemp -d /tmp/ab-collect-XXXXXX)
         tar -xf "$AB_DIR/results-${2:?job id}.tar" -C "$out"
         python3 "$here/ab-collect.py" "$out"
-        cat "$out"/build-*/sass-instructions.txt 2>/dev/null | paste -sd' ' | sed 's/^/sass instructions runtime fixdirect fixproxy: /'
+        for v in runtime fixdirect fixproxy; do
+            echo "sass instructions $v: $(cat "$out/build-$v/sass-instructions.txt" 2>/dev/null)"
+        done
         rm -rf "$out"
         ;;
     *) echo "unknown command: $1" >&2; exit 2 ;;
