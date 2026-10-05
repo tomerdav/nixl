@@ -104,9 +104,24 @@ namespace detail {
 
 } // namespace detail
 
+// EXPERIMENT ONLY (dispatch A/B): fix the execution mode at compile time, as a
+// template parameter at the call site would. The wrapper is still unwrapped, but
+// the mode compare, the status tag and the other implementation are compiled out.
+#ifdef NIXL_DEVICE_FIXED_EXEC_MODE
+inline constexpr exec_mode_t fixed_exec_mode = static_cast<exec_mode_t>(NIXL_DEVICE_FIXED_EXEC_MODE);
+static_assert(fixed_exec_mode == exec_mode_t::UCX_DIRECT || fixed_exec_mode == exec_mode_t::PROXY);
+#endif
+
 template<level_t level>
 __device__ nixl_status_t
 getXferStatus(xferStatusH &xfer_status) {
+#ifdef NIXL_DEVICE_FIXED_EXEC_MODE
+    if constexpr (fixed_exec_mode == exec_mode_t::UCX_DIRECT) {
+        return ucx::getXferStatus<level>(xfer_status);
+    } else {
+        return proxy::getXferStatus<level>(xfer_status);
+    }
+#else
     switch (detail::loadExecutionMode(xfer_status)) {
     case exec_mode_t::UCX_DIRECT:
         return ucx::getXferStatus<level>(xfer_status);
@@ -115,6 +130,7 @@ getXferStatus(xferStatusH &xfer_status) {
     default:
         return NIXL_ERR_INVALID_PARAM;
     }
+#endif
 }
 
 template<level_t level>
@@ -130,6 +146,13 @@ put(const memViewElem &src,
     const memViewElem backend_src{src_view->backend_memview, src.index, src.offset};
     const memViewElem backend_dst{dst_view->backend_memview, dst.index, dst.offset};
 
+#ifdef NIXL_DEVICE_FIXED_EXEC_MODE
+    if constexpr (fixed_exec_mode == exec_mode_t::UCX_DIRECT) {
+        return ucx::put<level>(backend_src, backend_dst, size, channel_id, flags, xfer_status);
+    } else {
+        return proxy::put<level>(backend_src, backend_dst, size, channel_id, flags, xfer_status);
+    }
+#else
     // The destination decides: it is the view that names the peer.
     nixl_status_t status;
     if (dst_view->execution_mode == exec_mode_t::UCX_DIRECT) {
@@ -141,6 +164,7 @@ put(const memViewElem &src,
     }
     detail::writeExecutionMode<level>(xfer_status, status, dst_view->execution_mode);
     return status;
+#endif
 }
 
 template<level_t level>
@@ -153,6 +177,13 @@ atomicAdd(uint64_t value,
     const auto *view = detail::asDeviceMemView(counter.mvh);
     const memViewElem backend_counter{view->backend_memview, counter.index, counter.offset};
 
+#ifdef NIXL_DEVICE_FIXED_EXEC_MODE
+    if constexpr (fixed_exec_mode == exec_mode_t::UCX_DIRECT) {
+        return ucx::atomicAdd<level>(value, backend_counter, channel_id, flags, xfer_status);
+    } else {
+        return proxy::atomicAdd<level>(value, backend_counter, channel_id, flags, xfer_status);
+    }
+#else
     nixl_status_t status;
     if (view->execution_mode == exec_mode_t::UCX_DIRECT) {
         status = ucx::atomicAdd<level>(value, backend_counter, channel_id, flags, xfer_status);
@@ -163,11 +194,19 @@ atomicAdd(uint64_t value,
     }
     detail::writeExecutionMode<level>(xfer_status, status, view->execution_mode);
     return status;
+#endif
 }
 
 __device__ inline void *
 getPtr(nixlMemViewH mvh, size_t index) {
     const auto *view = detail::asDeviceMemView(mvh);
+#ifdef NIXL_DEVICE_FIXED_EXEC_MODE
+    if constexpr (fixed_exec_mode == exec_mode_t::UCX_DIRECT) {
+        return ucx::getPtr(view->backend_memview, index);
+    } else {
+        return proxy::getPtr(view->backend_memview, index);
+    }
+#else
     switch (view->execution_mode) {
     case exec_mode_t::UCX_DIRECT:
         return ucx::getPtr(view->backend_memview, index);
@@ -176,6 +215,7 @@ getPtr(nixlMemViewH mvh, size_t index) {
     default:
         return nullptr;
     }
+#endif
 }
 
 } // namespace nixl::gpu::impl
