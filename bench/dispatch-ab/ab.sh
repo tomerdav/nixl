@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
 # Dispatch A/B on DFW: runtime exec-mode branch vs the mode fixed at compile time. Run from the login node
 # with bash (the login shell is csh):
-#   bash ab.sh build <nixl-src.tar>    one node, in the image: build runtime, fixdirect and fixproxy
-#   bash ab.sh run [sbatch options]    one exclusive node: warm-ups, then AB_REPS ABBA pairs per cell
-#   bash ab.sh collect                 the paired-difference table (python3 on the login node is enough)
+#   bash ab.sh run [sbatch options]    one exclusive node: build on node-local disk, warm-ups, AB_REPS ABBA
+#                                      pairs per cell; results land in $AB_DIR/results-<job>.tar
+#   bash ab.sh collect <job>           the paired-difference table, from that tarball unpacked under /tmp
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/ab-env.sh"
 source "$EP_KIT/env-dfw.sh"
-ctr=(--container-image="$EP_CONTAINER_IMAGE" --container-mounts="$EP_CONTAINER_MOUNTS" --no-container-remap-root)
-one=(-A "$DFW_ACCOUNT" -N1 --ntasks=1 --cpus-per-task="${DFW_CPUS:-128}" --gpus-per-node=8 --exclusive)
-case "${1:?build|run|collect}" in
-    build)
-        src=$(realpath "${2:?source tarball}")
-        srun "${one[@]}" -p batch_short -t 90 "${ctr[@]}" bash "$here/ab-build.sh" "$src" < /dev/null
-        ;;
+case "${1:?run|collect}" in
     run)
         shift
-        mkdir -p "$AB_DIR/results"
         sbatch -A "$DFW_ACCOUNT" -p "$DFW_PARTITION" -N1 --gpus-per-node=8 \
-            --output="$AB_DIR/results/ab-%j.out" "$@" \
+            --output="$AB_DIR/ab-%j.out" "$@" \
             --export=ALL,AB_KIT="$here" "$here/ab-sweep.sh"
         ;;
     collect)
-        python3 "$here/ab-collect.py" "$AB_DIR/results"
+        out=$(mktemp -d /tmp/ab-collect-XXXXXX)
+        tar -xf "$AB_DIR/results-${2:?job id}.tar" -C "$out"
+        python3 "$here/ab-collect.py" "$out"
+        cat "$out"/build-*/sass-instructions.txt 2>/dev/null | paste -sd' ' | sed 's/^/sass instructions runtime fixdirect fixproxy: /'
+        rm -rf "$out"
         ;;
     *) echo "unknown command: $1" >&2; exit 2 ;;
 esac
