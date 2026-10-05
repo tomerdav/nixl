@@ -47,8 +47,10 @@ export EP_RESULTS=$AB_RESULTS
 
 run() {  # run <tag> <variant> <mode> <nvl>
     local tag=$1 v=$2 mode=$3 nvl=$4
-    echo "[$(date +%T)] $tag"
-    srun "${step[@]}" --kill-on-bad-exit=1 "${ctr[@]}" --export=ALL,EP_ROOT="$AB_WORK/$v" \
+    local tls=${EP_UCX_TLS:-all}
+    [ "$mode/$nvl" = direct/nvl ] && [ -n "$AB_DIRECT_NVL_TLS" ] && tls=$AB_DIRECT_NVL_TLS
+    echo "[$(date +%T)] $tag UCX_TLS=$tls"
+    srun "${step[@]}" --kill-on-bad-exit=1 "${ctr[@]}" --export=ALL,EP_ROOT="$AB_WORK/$v",EP_UCX_TLS="$tls" \
         "$EP_KIT/run_node.sh" "$tag" "$mode" "$nvl" "$plan" "$node" < /dev/null
     echo "[$(date +%T)] $tag rc=$?"
     tar -rf "$results_tar" -C "$AB_RESULTS" "./$tag"

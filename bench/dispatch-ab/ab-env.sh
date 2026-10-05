@@ -14,3 +14,6 @@ export AB_RANKS=${AB_RANKS:-8}
 export AB_NVL=${AB_NVL:-nvl nonvl}
 export AB_MODES=${AB_MODES:-direct proxy}
 export EP_KINETO=${EP_KINETO:-1}
+# Direct mode with NVLink: with rc_gda allowed, same-node peers get a GDA lane and nixlGetPtr returns null,
+# so EP falls back to RDMA. Excluding rc_gda leaves cuda_ipc for them. Single node only: every peer is local.
+export AB_DIRECT_NVL_TLS=${AB_DIRECT_NVL_TLS-^rc_gda}
