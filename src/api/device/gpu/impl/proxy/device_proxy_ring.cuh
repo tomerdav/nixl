@@ -31,6 +31,8 @@ namespace nixl::gpu::impl::proxy {
 struct proxyXferStatus {
     nixlProxyCompletionSlot *slot; // device pointer to the channel's nixlProxyCompletionSlot
     uint64_t opIdx;
+    uint64_t *shutdownWord;
+    uint32_t pendingPolls;
 };
 
 static_assert(sizeof(proxyXferStatus) <= xfer_status_payload_size,
@@ -64,12 +66,7 @@ struct proxyDeviceContext : nixlProxyDeviceContextData {
         assert(peer < max_peers && num_channels != 0);
         channel_id %= num_channels;
 
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> shut(*shutdown_word);
-        if (shut.load(cuda::memory_order_relaxed) ==
-            static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN)) {
-            return NIXL_ERR_BACKEND;
-        }
-
+        // Shutdown is checked when the ring is full and by pending status polls, not per enqueue.
         nixlProxyRingDesc &ring_desc = rings[ringIndex(peer, channel_id)];
         assert(ring_desc.work_ring != nullptr && ring_desc.completion_slot != nullptr);
         nixlProxyWorkRing *ring = ring_desc.work_ring;
@@ -87,6 +84,7 @@ struct proxyDeviceContext : nixlProxyDeviceContextData {
             cached_consumer_idx = cons.load(cuda::memory_order_acquire);
             *ring->consumer_idx_cache = cached_consumer_idx;
 
+            cuda::atomic_ref<uint64_t, cuda::thread_scope_system> shut(*shutdown_word);
             if (shut.load(cuda::memory_order_relaxed) ==
                 static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN)) {
                 return NIXL_ERR_BACKEND;
@@ -107,7 +105,7 @@ struct proxyDeviceContext : nixlProxyDeviceContextData {
         command_op_idx.store(submission_op_idx, cuda::memory_order_release);
 
         if (xfer_status != nullptr) {
-            proxyXferStatus pxs{ring_desc.completion_slot, submission_op_idx};
+            proxyXferStatus pxs{ring_desc.completion_slot, submission_op_idx, shutdown_word, 0};
             memcpy(xfer_status->storage, &pxs, sizeof(proxyXferStatus));
         }
 
@@ -121,8 +119,8 @@ struct proxyDeviceContext : nixlProxyDeviceContextData {
     // - completed_idx >= op_idx   => this op completed, so it succeeded
     // - otherwise                 => this op is still pending
     __device__ inline static nixl_status_t
-    pollXferStatus(const xferStatusH &xfer_status) {
-        const proxyXferStatus *pxs = reinterpret_cast<const proxyXferStatus *>(xfer_status.storage);
+    pollXferStatus(xferStatusH &xfer_status) {
+        proxyXferStatus *pxs = reinterpret_cast<proxyXferStatus *>(xfer_status.storage);
         assert(pxs->slot != nullptr);
 
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> comp_idx(pxs->slot->completed_idx);
@@ -133,7 +131,18 @@ struct proxyDeviceContext : nixlProxyDeviceContextData {
         if (failed_idx != 0 && pxs->opIdx >= failed_idx) {
             return pxs->slot->completion_status;
         }
-        return completed_idx >= pxs->opIdx ? NIXL_SUCCESS : NIXL_IN_PROG;
+        if (completed_idx >= pxs->opIdx) {
+            return NIXL_SUCCESS;
+        }
+        // A pending op reads the mapped-host shutdown word only every 64th poll.
+        if (++pxs->pendingPolls % 64 != 0) {
+            return NIXL_IN_PROG;
+        }
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> shut(*pxs->shutdownWord);
+        return shut.load(cuda::memory_order_relaxed) ==
+                static_cast<uint64_t>(nixl_proxy_control_state_t::SHUTDOWN) ?
+            NIXL_ERR_BACKEND :
+            NIXL_IN_PROG;
     }
 };
 
