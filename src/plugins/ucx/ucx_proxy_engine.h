@@ -58,6 +58,10 @@ public:
     nixl_status_t
     getNotifs(notif_list_t &notif_list) override;
 
+    nixl_status_t
+    loadRemoteConnInfo(const std::string &remote_agent,
+                       const std::string &remote_conn_info) override;
+
 protected:
     void
     appendNotif(std::string &&remote_name, std::string &&msg) override;
@@ -70,6 +74,8 @@ private:
     prepProxyMemView(const DlistT &dlist, nixlMemViewH &mvh) const;
 
     nixl::deviceOps &ops_;
+    /** NUMA node endpoints are created on, or -1. */
+    const int numaNode_;
     std::mutex notifMutex_;
     std::unique_ptr<nixl::proxyRuntime> runtime_;
 };

@@ -18,6 +18,8 @@
 #ifndef NIXL_SRC_UTILS_THREAD_AFFINITY_H
 #define NIXL_SRC_UTILS_THREAD_AFFINITY_H
 
+#include <sched.h>
+
 #include "nixl_types.h"
 
 namespace nixl {
@@ -30,6 +32,22 @@ namespace nixl {
  */
 [[nodiscard]] nixl_status_t
 bindThreadToNumaNode(int node) noexcept;
+
+/** @brief bindThreadToNumaNode for its lifetime, then restores the thread's affinity and policy. */
+class scopedNumaBinding {
+public:
+    explicit scopedNumaBinding(int node) noexcept;
+    ~scopedNumaBinding();
+    scopedNumaBinding(const scopedNumaBinding &) = delete;
+    scopedNumaBinding &
+    operator=(const scopedNumaBinding &) = delete;
+
+private:
+    bool saved_ = false;
+    cpu_set_t affinity_;
+    int policy_ = 0;
+    unsigned long nodes_[16] = {};
+};
 
 } // namespace nixl
 

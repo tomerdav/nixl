@@ -131,6 +131,18 @@ public:
         return NIXL_ERR_NOT_SUPPORTED;
     }
 
+    /** @brief Host NUMA node closest to the calling thread's active device, or -1. */
+    [[nodiscard]] int
+    activeHostNumaNode() noexcept {
+        int device;
+        int node;
+        if (getActiveDevice(device) != NIXL_SUCCESS ||
+            getHostNumaNode(device, node) != NIXL_SUCCESS) {
+            return -1;
+        }
+        return node;
+    }
+
 protected:
     /** @brief Allocate device storage, assigning ptr only on success. */
     [[nodiscard]] virtual nixl_status_t

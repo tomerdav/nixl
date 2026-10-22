@@ -31,6 +31,7 @@
 #include "device/proxy/proxy_config.h"
 #include "device/proxy/proxy_runtime.h"
 #include "device/proxy/proxy_transport.h"
+#include "thread_affinity.h"
 
 static_assert(sizeof(nixlUcxReq) <= sizeof(uint64_t),
               "UCX proxy requests must fit in the opaque token field");
@@ -290,6 +291,7 @@ proxyEngine::proxyEngine(const nixlBackendInitParams &init_params, const nixl::p
     // The temporary params outlive the base constructor, the only place they are read.
     : nixlUcxEngine(proxyInitParams(init_params, config, nixl_b_params_t{})),
       ops_(requireDeviceOps()),
+      numaNode_(config.numa_bind ? ops_.activeHostNumaNode() : -1),
       runtime_(nixl::proxyRuntime::create(std::make_unique<transport>(getSharedWorkers(), config),
                                           config,
                                           ops_)) {
@@ -310,6 +312,13 @@ proxyEngine::getNotifs(notif_list_t &notif_list) {
     const std::lock_guard lock(notifMutex_);
     notifList_.swap(notif_list);
     return NIXL_SUCCESS;
+}
+
+nixl_status_t
+proxyEngine::loadRemoteConnInfo(const std::string &remote_agent,
+                                const std::string &remote_conn_info) {
+    const nixl::scopedNumaBinding scope(numaNode_);
+    return nixlUcxEngine::loadRemoteConnInfo(remote_agent, remote_conn_info);
 }
 
 void

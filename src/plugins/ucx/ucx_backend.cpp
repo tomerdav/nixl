@@ -37,6 +37,7 @@
 #include "device/device_memview.h"
 #include "device/device_ops.h"
 #include "device/proxy/proxy_config.h"
+#include "thread_affinity.h"
 
 namespace {
 [[nodiscard]] bool
@@ -81,6 +82,10 @@ nixlUcxEngine::create(const nixlBackendInitParams &init_params) {
             nixl::throwRuntimeError(
                 "num_threads is not supported with device_proxy=true; use proxy_thread_count");
         }
+        nixl::deviceOps *ops = nixl::getDeviceOps();
+        const int numa_node = proxy_config.numa_bind && ops ? ops->activeHostNumaNode() : -1;
+        // UCX objects, rings and proxy threads are created on the device's NUMA node.
+        nixl::scopedNumaBinding scope(numa_node);
         engine = new nixl::ucx::proxyEngine(init_params, proxy_config);
     } else if (num_threads > 0) {
         engine = new nixlUcxThreadPoolEngine(init_params, num_threads);

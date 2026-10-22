@@ -30,22 +30,6 @@
 
 namespace nixl {
 
-namespace {
-
-    /** Host NUMA node of the calling thread's device, or -1. */
-    int
-    deviceNumaNode(deviceOps &ops) noexcept {
-        int device;
-        int node;
-        if (ops.getActiveDevice(device) != NIXL_SUCCESS ||
-            ops.getHostNumaNode(device, node) != NIXL_SUCCESS) {
-            return -1;
-        }
-        return node;
-    }
-
-} // namespace
-
 proxyRuntime::proxyRuntime(std::unique_ptr<proxyTransport> transport,
                            const proxyConfig &config,
                            deviceOps &allocator) noexcept
@@ -149,7 +133,7 @@ proxyRuntime::build() {
     }
     memview_manager_ = std::make_unique<proxyMemViewManager>(allocator_, deviceContext());
 
-    const int numa_node = config_.numa_bind ? deviceNumaNode(allocator_) : -1;
+    const int numa_node = config_.numa_bind ? allocator_.activeHostNumaNode() : -1;
     if (numa_node >= 0) {
         NIXL_INFO << "Proxy threads bind to NUMA node " << numa_node;
     }

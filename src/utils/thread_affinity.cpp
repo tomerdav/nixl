@@ -77,4 +77,20 @@ bindThreadToNumaNode(int node) noexcept {
     return NIXL_SUCCESS;
 }
 
+scopedNumaBinding::scopedNumaBinding(int node) noexcept {
+    if (node < 0 || pthread_getaffinity_np(pthread_self(), sizeof(affinity_), &affinity_) != 0 ||
+        syscall(SYS_get_mempolicy, &policy_, nodes_, sizeof(nodes_) * 8, nullptr, 0) != 0) {
+        return;
+    }
+    saved_ = true;
+    (void)bindThreadToNumaNode(node);
+}
+
+scopedNumaBinding::~scopedNumaBinding() {
+    if (saved_) {
+        pthread_setaffinity_np(pthread_self(), sizeof(affinity_), &affinity_);
+        syscall(SYS_set_mempolicy, policy_, nodes_, sizeof(nodes_) * 8);
+    }
+}
+
 } // namespace nixl
