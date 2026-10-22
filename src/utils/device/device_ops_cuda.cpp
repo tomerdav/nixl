@@ -18,6 +18,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cctype>
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -38,6 +40,26 @@ cudaStatus(cudaError_t error, const char *operation) {
         return NIXL_ERR_BACKEND;
     }
     return NIXL_SUCCESS;
+}
+
+/** The device's PCI numa_node from sysfs, or -1. */
+int
+pciNumaNode(int device_id) noexcept {
+    char bus_id[32];
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), device_id) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    std::string bdf(bus_id);
+    for (char &c : bdf) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (bdf.size() > 12) {
+        bdf = bdf.substr(bdf.size() - 12);
+    }
+    std::ifstream file("/sys/bus/pci/devices/" + bdf + "/numa_node");
+    int numa_node = -1;
+    return (file >> numa_node) ? numa_node : -1;
 }
 
 class cudaDeviceOps final : public nixl::deviceOps {
@@ -138,6 +160,25 @@ public:
     nixl_status_t
     setActiveDevice(int device_id) noexcept override {
         return cudaStatus(cudaSetDevice(device_id), "cudaSetDevice");
+    }
+
+    nixl_status_t
+    getHostNumaNode(int device_id, int &node) noexcept override {
+        int numa_node = -1;
+#if CUDART_VERSION >= 12020
+        if (cudaDeviceGetAttribute(&numa_node, cudaDevAttrHostNumaId, device_id) != cudaSuccess) {
+            cudaGetLastError();
+            numa_node = -1;
+        }
+#endif
+        if (numa_node < 0) {
+            numa_node = pciNumaNode(device_id);
+        }
+        if (numa_node < 0) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+        node = numa_node;
+        return NIXL_SUCCESS;
     }
 
     nixl_status_t

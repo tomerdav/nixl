@@ -122,6 +122,15 @@ public:
     [[nodiscard]] virtual nixl_status_t
     setActiveDevice(int device_id) noexcept = 0;
 
+    /**
+     * @brief Get the host NUMA node closest to `device_id`.
+     * @retval NIXL_ERR_NOT_SUPPORTED The backend or system cannot tell; `node` is unchanged.
+     */
+    [[nodiscard]] virtual nixl_status_t
+    getHostNumaNode(int, int &) noexcept {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
 protected:
     /** @brief Allocate device storage, assigning ptr only on success. */
     [[nodiscard]] virtual nixl_status_t

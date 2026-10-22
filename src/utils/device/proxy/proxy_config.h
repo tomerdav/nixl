@@ -34,6 +34,7 @@ inline constexpr std::string_view kProxyThreadCountParam = "proxy_thread_count";
 inline constexpr std::string_view kProxyMaxPeersParam = "proxy_max_peers";
 inline constexpr std::string_view kProxyRingDepthParam = "proxy_ring_depth";
 inline constexpr std::string_view kProxyDrainTimeoutParam = "proxy_drain_timeout_ms";
+inline constexpr std::string_view kProxyNumaBindParam = "proxy_numa_bind";
 
 inline constexpr uint32_t kDefaultProxyChannelCount = 4;
 /** Deliberately small: each peer costs a ring per channel; pass the real peer capacity. */
@@ -66,6 +67,8 @@ struct proxyConfig {
     uint32_t ring_depth = kDefaultProxyRingDepth;
     /** Drain deadline in milliseconds; 0 disables it. */
     uint32_t drain_timeout_ms = kDefaultProxyDrainTimeoutMs;
+    /** Pin proxy threads to the GPU's host NUMA node. */
+    bool numa_bind = true;
 
     [[nodiscard]] size_t
     ringCount() const noexcept {

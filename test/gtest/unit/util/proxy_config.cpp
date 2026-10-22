@@ -46,8 +46,10 @@ TEST(ProxyConfigTest, AcceptsParameters) {
     EXPECT_EQ(config.max_peers, nixl::kDefaultProxyMaxPeers);
     EXPECT_EQ(config.ring_depth, nixl::kDefaultProxyRingDepth);
     EXPECT_EQ(config.drain_timeout_ms, nixl::kDefaultProxyDrainTimeoutMs);
+    EXPECT_TRUE(config.numa_bind);
 
     ASSERT_EQ(parse({{"device_proxy", "true"},
+                     {"proxy_numa_bind", "false"},
                      {"proxy_channel_count", "3"},
                      {"proxy_thread_count", "15"},
                      {"proxy_max_peers", "5"},
@@ -60,6 +62,7 @@ TEST(ProxyConfigTest, AcceptsParameters) {
     EXPECT_EQ(config.max_peers, 5u);
     EXPECT_EQ(config.ring_depth, 512u);
     EXPECT_EQ(config.drain_timeout_ms, 0u);
+    EXPECT_FALSE(config.numa_bind);
     EXPECT_EQ(config.ringCount(), 15u);
 }
 
@@ -85,6 +88,7 @@ TEST(ProxyConfigTest, RejectsParameters) {
          {{"device_proxy", "true"}, {"proxy_worker_count", "2"}},
          NIXL_ERR_INVALID_PARAM},
         {"tuning without enable", {{"proxy_channel_count", "2"}}, NIXL_ERR_INVALID_PARAM},
+        {"numa bind without enable", {{"proxy_numa_bind", "false"}}, NIXL_ERR_INVALID_PARAM},
         {"threads not dividing channels",
          {{"device_proxy", "true"}, {"proxy_channel_count", "4"}, {"proxy_thread_count", "3"}},
          NIXL_ERR_INVALID_PARAM},

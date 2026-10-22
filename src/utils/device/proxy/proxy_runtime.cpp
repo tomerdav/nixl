@@ -30,6 +30,22 @@
 
 namespace nixl {
 
+namespace {
+
+    /** Host NUMA node of the calling thread's device, or -1. */
+    int
+    deviceNumaNode(deviceOps &ops) noexcept {
+        int device;
+        int node;
+        if (ops.getActiveDevice(device) != NIXL_SUCCESS ||
+            ops.getHostNumaNode(device, node) != NIXL_SUCCESS) {
+            return -1;
+        }
+        return node;
+    }
+
+} // namespace
+
 proxyRuntime::proxyRuntime(std::unique_ptr<proxyTransport> transport,
                            const proxyConfig &config,
                            deviceOps &allocator) noexcept
@@ -47,7 +63,8 @@ proxyRuntime::create(std::unique_ptr<proxyTransport> transport,
                      deviceOps &allocator) {
     NIXL_INFO << "ProxyRuntime::create: max_peers=" << config.max_peers
               << " channel_count=" << config.channel_count
-              << " thread_count=" << config.thread_count << " ring_depth=" << config.ring_depth;
+              << " thread_count=" << config.thread_count << " ring_depth=" << config.ring_depth
+              << " numa_bind=" << config.numa_bind;
 
     if (!transport) {
         throwRuntimeError("ProxyRuntime::create: no transport");
@@ -132,8 +149,12 @@ proxyRuntime::build() {
     }
     memview_manager_ = std::make_unique<proxyMemViewManager>(allocator_, deviceContext());
 
+    const int numa_node = config_.numa_bind ? deviceNumaNode(allocator_) : -1;
+    if (numa_node >= 0) {
+        NIXL_INFO << "Proxy threads bind to NUMA node " << numa_node;
+    }
     worker_context_ = std::make_unique<const proxyWorkerContext>(proxyWorkerContext{
-        *transport_, drain_requested_, shutting_down_, stop_source_.get_token()});
+        *transport_, drain_requested_, shutting_down_, stop_source_.get_token(), numa_node});
     workers_.reserve(worker_count);
     for (uint32_t worker_idx = 0; worker_idx < worker_count; worker_idx++) {
         const proxyThreadShare share = config_.threadShare(worker_idx);

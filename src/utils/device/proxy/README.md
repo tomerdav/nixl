@@ -22,6 +22,14 @@ kernels write fixed-layout commands (`proxy_protocol.h`) into per-channel rings,
 turn each command into an ordinary backend transfer through a `nixl::proxyTransport`. The proxy
 ignores `nixl::gpu::flags::defer`; a command carries no flags until a consumer exists.
 
+## Proxy threads and NUMA
+
+Proxy threads (`nixl-proxy-<n>`) bind to the CPUs of the host NUMA node closest to the runtime's
+device, within the affinity they inherit from the thread that creates the backend, and prefer that
+node for their own memory. They keep the inherited affinity when the node is unknown or none of its
+CPUs is allowed, or with `proxy_numa_bind=false`. Proxy threads busy-poll, so keep the proxy threads
+of all ranks sharing a NUMA node within its physical core count.
+
 ## Transport contract
 
 `nixl::proxyTransport` (`proxy_transport.h`) is the interface a backend implements to sit behind
