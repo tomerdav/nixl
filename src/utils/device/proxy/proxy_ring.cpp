@@ -24,7 +24,8 @@ nixl_status_t
 proxyRing::allocate(deviceOps &allocator,
                     uint32_t depth,
                     proxyControlBuffer &control,
-                    size_t ring_index) {
+                    size_t ring_index,
+                    int numa_node) {
     uint64_t *const consumer_idx_dev =
         control.devicePointer(proxyControlBuffer::ringSlot(ring_index));
     if (depth == 0 || consumer_idx_dev == nullptr) {
@@ -44,10 +45,10 @@ proxyRing::allocate(deviceOps &allocator,
     if (allocator.allocDeviceMem(sizeof(nixlProxyWorkRing), work_ring_mem_) != NIXL_SUCCESS ||
         allocator.allocDeviceMem(sizeof(uint64_t), producer_idx_mem_) != NIXL_SUCCESS ||
         allocator.allocDeviceMem(sizeof(uint64_t), consumer_idx_cache_mem_) != NIXL_SUCCESS ||
-        allocator.allocMappedHostMem(sizeof(nixlProxyCommand) * depth, records_mem_) !=
+        allocator.allocMappedHostMem(sizeof(nixlProxyCommand) * depth, records_mem_, numa_node) !=
             NIXL_SUCCESS ||
-        allocator.allocMappedHostMem(sizeof(nixlProxyCompletionSlot), completion_slot_mem_) !=
-            NIXL_SUCCESS) {
+        allocator.allocMappedHostMem(
+            sizeof(nixlProxyCompletionSlot), completion_slot_mem_, numa_node) != NIXL_SUCCESS) {
         NIXL_ERROR << "proxyRing::allocate: device allocation failed";
         deallocate();
         return NIXL_ERR_BACKEND;

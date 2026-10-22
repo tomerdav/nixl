@@ -17,11 +17,18 @@
 #include "device/device_ops.h"
 
 #include <cuda_runtime.h>
+#include <linux/mempolicy.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <cctype>
+#include <cerrno>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common/nixl_log.h"
 #include "device/device_ops_cuda_gdrcopy.h"
@@ -40,6 +47,42 @@ cudaStatus(cudaError_t error, const char *operation) {
         return NIXL_ERR_BACKEND;
     }
     return NIXL_SUCCESS;
+}
+
+size_t
+pageAligned(size_t size) noexcept {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    return (size + page - 1) / page * page;
+}
+
+bool
+preferNode(void *addr, size_t length, int node) noexcept {
+    constexpr size_t bits = sizeof(unsigned long) * 8;
+    std::vector<unsigned long> mask(node / bits + 1);
+    mask[node / bits] = 1UL << (node % bits);
+    const unsigned long max_node = mask.size() * bits + 1;
+    return syscall(SYS_mbind, addr, length, MPOL_PREFERRED, mask.data(), max_node, 0) == 0;
+}
+
+/** Zeroed, registered pages preferring `node`, or nullptr; `length` is what to unmap. */
+void *
+mapOnNode(size_t size, int node, size_t &length) noexcept {
+    length = pageAligned(size);
+    void *pages = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED) {
+        return nullptr;
+    }
+    if (!preferNode(pages, length, node)) {
+        NIXL_DEBUG << "mbind to NUMA node " << node << " failed: " << std::strerror(errno);
+    }
+    std::memset(pages, 0, length);
+    if (cudaHostRegister(pages, length, cudaHostRegisterMapped | cudaHostRegisterPortable) !=
+        cudaSuccess) {
+        cudaGetLastError();
+        munmap(pages, length);
+        return nullptr;
+    }
+    return pages;
 }
 
 /** The device's PCI numa_node from sysfs, or -1. */
@@ -85,33 +128,57 @@ public:
     }
 
     nixl_status_t
-    doAllocMappedHostMem(void *&host_ptr, void *&dev_ptr, size_t size) noexcept override {
-        void *host_allocation;
+    doAllocMappedHostMem(void *&host_ptr,
+                         void *&dev_ptr,
+                         size_t size,
+                         int numa_node,
+                         size_t &length) noexcept override {
+        size_t mapped_length = 0;
+        // Own pages: cudaHostAlloc suballocates from chunks placed by their first user.
+        void *allocation = numa_node >= 0 ? mapOnNode(size, numa_node, mapped_length) : nullptr;
+        if (allocation == nullptr) {
+            if (numa_node >= 0) {
+                NIXL_INFO << "Mapped host memory not placed on NUMA node " << numa_node;
+            }
+            mapped_length = 0;
+            // Mapped guarantees cudaHostGetDevicePointer; portable permits use from other GPUs.
+            const nixl_status_t status = cudaStatus(
+                cudaHostAlloc(&allocation, size, cudaHostAllocMapped | cudaHostAllocPortable),
+                "cudaHostAlloc");
+            if (status != NIXL_SUCCESS) {
+                return status;
+            }
+        }
         void *device_alias;
-        // Mapped guarantees cudaHostGetDevicePointer; portable permits use from other GPUs.
-        nixl_status_t status = cudaStatus(
-            cudaHostAlloc(&host_allocation, size, cudaHostAllocMapped | cudaHostAllocPortable),
-            "cudaHostAlloc");
+        const nixl_status_t status = cudaStatus(
+            cudaHostGetDevicePointer(&device_alias, allocation, 0), "cudaHostGetDevicePointer");
         if (status != NIXL_SUCCESS) {
+            doFreeMappedHostMem(allocation, mapped_length);
             return status;
         }
-        status = cudaStatus(cudaHostGetDevicePointer(&device_alias, host_allocation, 0),
-                            "cudaHostGetDevicePointer");
-        if (status != NIXL_SUCCESS) {
-            doFreeMappedHostMem(host_allocation);
-            return status;
-        }
-        host_ptr = host_allocation;
+        host_ptr = allocation;
         dev_ptr = device_alias;
+        length = mapped_length;
         return NIXL_SUCCESS;
     }
 
     void
-    doFreeMappedHostMem(void *host_ptr) noexcept override {
-        // cudaFreeHost is a no-op on nullptr, matching doFreeDeviceMem.
-        const cudaError_t error = cudaFreeHost(host_ptr);
+    doFreeMappedHostMem(void *host_ptr, size_t length) noexcept override {
+        if (length == 0) {
+            // cudaFreeHost is a no-op on nullptr, matching doFreeDeviceMem.
+            const cudaError_t error = cudaFreeHost(host_ptr);
+            if (error != cudaSuccess) {
+                NIXL_WARN << cudaFailureMsg("cudaFreeHost", error);
+            }
+            return;
+        }
+        const cudaError_t error = cudaHostUnregister(host_ptr);
         if (error != cudaSuccess) {
-            NIXL_WARN << cudaFailureMsg("cudaFreeHost", error);
+            NIXL_WARN << cudaFailureMsg("cudaHostUnregister", error) << "; leaking the pages";
+            return;
+        }
+        if (munmap(host_ptr, length) != 0) {
+            NIXL_WARN << "munmap failed: " << std::strerror(errno);
         }
     }
 

@@ -66,7 +66,11 @@ namespace host_published_mem {
         doFreeDeviceMem(void *) noexcept override {}
 
         nixl_status_t
-        doAllocMappedHostMem(void *&host_ptr, void *&dev_ptr, size_t size) noexcept override {
+        doAllocMappedHostMem(void *&host_ptr,
+                             void *&dev_ptr,
+                             size_t size,
+                             int,
+                             size_t &length) noexcept override {
             if (fail_mapped) {
                 return NIXL_ERR_BACKEND;
             }
@@ -74,11 +78,12 @@ namespace host_published_mem {
             host_ptr = std::malloc(size);
             std::memset(host_ptr, 0xA5, size);
             dev_ptr = host_ptr;
+            length = size;
             return NIXL_SUCCESS;
         }
 
         void
-        doFreeMappedHostMem(void *host_ptr) noexcept override {
+        doFreeMappedHostMem(void *host_ptr, size_t) noexcept override {
             std::free(host_ptr);
             ++mapped_frees;
         }

@@ -48,12 +48,16 @@ public:
     /**
      * @brief Create a zeroed buffer holding the shutdown slot and `ring_count` ring slots.
      * @param[out] out Owning handle; unchanged on failure.
+     * @param numa_node Host NUMA node for a mapped host backing; -1 for no preference.
      * @retval NIXL_ERR_INVALID_PARAM ring_count is too large.
      * @retval NIXL_ERR_BACKEND Neither backing could be allocated.
      * @note `ops` must outlive the buffer.
      */
     [[nodiscard]] static nixl_status_t
-    create(deviceOps &ops, size_t ring_count, std::unique_ptr<proxyControlBuffer> &out);
+    create(deviceOps &ops,
+           size_t ring_count,
+           std::unique_ptr<proxyControlBuffer> &out,
+           int numa_node);
 
     proxyControlBuffer(const proxyControlBuffer &) = delete;
     proxyControlBuffer &

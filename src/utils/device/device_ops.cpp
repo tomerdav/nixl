@@ -93,18 +93,19 @@ deviceOps::allocDeviceMem(size_t size, deviceMem &out) noexcept {
 }
 
 nixl_status_t
-deviceOps::allocMappedHostMem(size_t size, mappedHostMem &out) noexcept {
+deviceOps::allocMappedHostMem(size_t size, mappedHostMem &out, int numa_node) noexcept {
     if (size == 0) {
         NIXL_ERROR << "Mapped host allocation requires nonzero size";
         return NIXL_ERR_INVALID_PARAM;
     }
     void *host_ptr;
     void *dev_ptr;
-    const nixl_status_t status = doAllocMappedHostMem(host_ptr, dev_ptr, size);
+    size_t length;
+    const nixl_status_t status = doAllocMappedHostMem(host_ptr, dev_ptr, size, numa_node, length);
     if (status != NIXL_SUCCESS) {
         return status;
     }
-    out = mappedHostMem(this, host_ptr, dev_ptr);
+    out = mappedHostMem(this, host_ptr, dev_ptr, length);
     return NIXL_SUCCESS;
 }
 

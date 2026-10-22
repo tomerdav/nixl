@@ -28,10 +28,14 @@ proxyChannel::proxyChannel(uint32_t channel_id, uint32_t max_peers)
       rings_(max_peers) {}
 
 nixl_status_t
-proxyChannel::allocate(deviceOps &allocator, uint32_t depth, proxyControlBuffer &control) {
+proxyChannel::allocate(deviceOps &allocator,
+                       uint32_t depth,
+                       proxyControlBuffer &control,
+                       int numa_node) {
     for (uint32_t peer = 0; peer < rings_.size(); ++peer) {
         const size_t ring_index = static_cast<size_t>(id_) * rings_.size() + peer;
-        const nixl_status_t rc = rings_[peer].allocate(allocator, depth, control, ring_index);
+        const nixl_status_t rc =
+            rings_[peer].allocate(allocator, depth, control, ring_index, numa_node);
         if (rc != NIXL_SUCCESS) {
             return rc;
         }
