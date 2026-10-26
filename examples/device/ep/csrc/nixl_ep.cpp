@@ -30,12 +30,17 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <torch/python.h>
 
+#include <sched.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <set>
 #include <unordered_set>
 
 #define NIXL_ETCD_WATCH_TIMEOUT std::chrono::microseconds(1000000000) // 1000 seconds
@@ -49,6 +54,59 @@ void sleep_ms(int milliseconds) {
 uint64_t milliseconds_to_cycles(uint64_t milliseconds, int device_clock_rate_khz) {
     EP_HOST_ASSERT(device_clock_rate_khz > 0);
     return milliseconds * static_cast<uint64_t>(device_clock_rate_khz);
+}
+
+std::string read_line(const std::string& path) {
+    std::ifstream file(path);
+    std::string line;
+    std::getline(file, line);
+    return line;
+}
+
+// Proxy threads busy-poll and are bound to their GPU's NUMA node, so the node's cores must fit them all.
+void warn_proxy_thread_budget(int device, int proxy_threads) {
+    int domain = 0;
+    int bus = 0;
+    int slot = 0;
+    cudaDeviceGetAttribute(&domain, cudaDevAttrPciDomainId, device);
+    cudaDeviceGetAttribute(&bus, cudaDevAttrPciBusId, device);
+    cudaDeviceGetAttribute(&slot, cudaDevAttrPciDeviceId, device);
+    char bdf[16];
+    std::snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.0", domain, bus, slot);
+    const std::string pci = "/sys/bus/pci/devices/";
+    const std::string node = read_line(pci + bdf + "/numa_node");
+    if (node.empty() || node == "-1") {
+        return;
+    }
+
+    int gpus = 0;
+    std::error_code ec;
+    for (const auto& dev : std::filesystem::directory_iterator(pci, ec)) {
+        if (read_line(dev.path() / "vendor") == "0x10de" && read_line(dev.path() / "class").rfind("0x030", 0) == 0 &&
+            read_line(dev.path() / "numa_node") == node) {
+            ++gpus;
+        }
+    }
+
+    std::set<std::string> cores;
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            const std::string sys = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+            if (CPU_ISSET(cpu, &allowed) && std::filesystem::exists(sys + "/node" + node)) {
+                cores.insert(read_line(sys + "/topology/thread_siblings_list"));
+            }
+        }
+    }
+
+    const char* local = std::getenv("LOCAL_WORLD_SIZE");
+    const int ranks = local ? std::min(std::atoi(local), gpus) : gpus;
+    if (!cores.empty() && ranks * proxy_threads > static_cast<int>(cores.size())) {
+        std::fprintf(stderr,
+                     "WARNING: NIXL EP: %d rank(s) x %d proxy threads on NUMA node %s exceed its %zu physical cores; "
+                     "proxy performance can collapse. Lower NIXL_EP_PROXY_THREADS or NIXL_EP_NUM_CHANNELS.\n",
+                     ranks, proxy_threads, node.c_str(), cores.size());
+    }
 }
 
 } // namespace
@@ -807,8 +865,12 @@ void Buffer::_nixl_agent_init() {
         init_params["device_proxy"] = "true";
         init_params["proxy_channel_count"] = num_channels;
         init_params["proxy_max_peers"] = std::to_string(max_num_ranks);
-        if (const char *threads = std::getenv("NIXL_EP_PROXY_THREADS")) {
+        const char *threads = std::getenv("NIXL_EP_PROXY_THREADS");
+        if (threads) {
             init_params["proxy_thread_count"] = threads;
+        }
+        if (rank == 0) {
+            warn_proxy_thread_budget(device_id, std::atoi(threads ? threads : num_channels.c_str()));
         }
         init_params["ucx_num_device_channels"] = "1";
         init_params["engine_config"] = "FENCE_MODE=ep_based";
