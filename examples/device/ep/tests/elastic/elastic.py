@@ -19,8 +19,10 @@
 # limitations under the License.
 
 import argparse
+import multiprocessing
 import os
 import random
+import shutil
 import signal
 import sys
 import threading
@@ -49,6 +51,7 @@ from utils import (  # noqa: E402
 
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
+ASSIGNED_RANK_ENV = "ELASTIC_ASSIGNED_RANK"
 
 TMA_TOKEN_ALIGNMENT = 4
 
@@ -467,10 +470,45 @@ def test_main(
             )
 
 
-def worker(torch_rank: int, args: argparse.Namespace):
+def gpu_numa_node() -> int:
+    props = torch.cuda.get_device_properties(0)
+    bdf = (
+        f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+    )
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
+            return int(f.read())
+    except OSError:
+        return -1
+
+
+# Re-runs this rank under numactl on its GPU's NUMA node, keeping the rank it was assigned.
+def exec_under_numactl(torch_rank: int, assigned: tuple):
+    node = gpu_numa_node()
+    numactl = shutil.which("numactl")
+    if node < 0 or not numactl:
+        print(
+            f"Process {torch_rank} -> not NUMA-bound (node {node}, numactl {numactl})",
+            flush=True,
+        )
+        return
+    os.environ[ASSIGNED_RANK_ENV] = ",".join(map(str, (torch_rank, *assigned)))
+    os.execv(
+        numactl,
+        [
+            numactl,
+            f"--cpunodebind={node}",
+            f"--preferred={node}",
+            sys.executable,
+            *sys.argv,
+        ],
+    )
+
+
+def worker(torch_rank: int, args: argparse.Namespace, assigned: tuple | None = None):
     server_addr = args.tcp_server if args.tcp_server else "127.0.0.1"
     rank_client = rank_server.RankClient(server_addr, RANK_SERVER_PORT)
-    local_rank, global_rank, last_active_phase = rank_client.get_rank()
+    local_rank, global_rank, last_active_phase = assigned or rank_client.get_rank()
     plan = Plan(
         args.plan,
         global_rank,
@@ -491,6 +529,8 @@ def worker(torch_rank: int, args: argparse.Namespace):
 
     # Initialize torch
     os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
+    if args.numa_bind and not assigned and multiprocessing.parent_process():
+        exec_under_numactl(torch_rank, (local_rank, global_rank, last_active_phase))
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.cuda.set_device(0)
@@ -673,8 +713,21 @@ def main():
         action="store_true",
         help="Enable strict phase-local validation of observed rank failures against the plan",
     )
+    parser.add_argument(
+        "--numa-bind",
+        action="store_true",
+        help="Run each spawned rank under numactl on its GPU's NUMA node (CPUs and preferred memory)",
+    )
 
     args = parser.parse_args()
+
+    assigned = os.environ.pop(ASSIGNED_RANK_ENV, None)
+    if assigned:
+        torch_rank, *rank = (
+            None if v == "None" else int(v) for v in assigned.split(",")
+        )
+        worker(torch_rank, args, tuple(rank))
+        return
 
     if not args.tcp_server:
         print("Starting TCPStore and rank server locally", flush=True)

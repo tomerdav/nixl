@@ -24,6 +24,8 @@ python3 tests/elastic/elastic.py \
     --tcp-server $MASTER_IP
 ```
 
+`--numa-bind` re-runs each spawned rank under `numactl --cpunodebind=N --preferred=N`, where N is its GPU's NUMA node.
+
 ### Available Test Plans
 
 - `no_expansion.json`: Static 4 ranks (baseline)
