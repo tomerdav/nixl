@@ -58,7 +58,11 @@ public:
 
     /** Publishes its consumer index through control-buffer ring `ring_index`. */
     [[nodiscard]] nixl_status_t
-    allocate(deviceOps &allocator, uint32_t depth, proxyControlBuffer &control, size_t ring_index);
+    allocate(deviceOps &allocator,
+             uint32_t depth,
+             proxyControlBuffer &control,
+             size_t ring_index,
+             int numa_node);
 
     void
     deallocate() noexcept;

@@ -29,7 +29,8 @@ proxyControlBuffer::proxyControlBuffer(std::unique_ptr<hostPublishedDeviceMem> m
 nixl_status_t
 proxyControlBuffer::create(deviceOps &ops,
                            size_t ring_count,
-                           std::unique_ptr<proxyControlBuffer> &out) {
+                           std::unique_ptr<proxyControlBuffer> &out,
+                           int numa_node) {
     if (ring_count > std::numeric_limits<size_t>::max() / sizeof(uint64_t) - ringSlot(0)) {
         NIXL_ERROR << "Invalid proxy control buffer size: " << ring_count << " ring(s)";
         return NIXL_ERR_INVALID_PARAM;
@@ -37,7 +38,7 @@ proxyControlBuffer::create(deviceOps &ops,
 
     std::unique_ptr<hostPublishedDeviceMem> mem;
     const nixl_status_t status =
-        ops.allocHostPublishedMem(sizeof(uint64_t) * ringSlot(ring_count), mem);
+        ops.allocHostPublishedMem(sizeof(uint64_t) * ringSlot(ring_count), mem, numa_node);
     if (status != NIXL_SUCCESS) {
         return status;
     }

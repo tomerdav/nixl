@@ -33,6 +33,7 @@ constexpr std::array kKnownProxyParams = {
     nixl::kProxyMaxPeersParam,
     nixl::kProxyRingDepthParam,
     nixl::kProxyDrainTimeoutParam,
+    nixl::kProxyNumaBindParam,
 };
 
 [[nodiscard]] bool
@@ -74,6 +75,8 @@ parseProxyConfig(const nixlBackendInitParams &init_params, proxyConfig &config) 
     try {
         parsed.enabled =
             getBackendParamDefaulted<bool>(params, std::string(kProxyEnabledParam), false);
+        parsed.numa_bind =
+            getBackendParamDefaulted<bool>(params, std::string(kProxyNumaBindParam), true);
         const auto channel_count =
             getBackendParamOptional<uint32_t>(params, std::string(kProxyChannelCountParam));
         const auto thread_count =

@@ -31,6 +31,7 @@ class mappedHostMem;
 
 struct mappedHostMemDeleter {
     deviceOps *ops = nullptr;
+    size_t length = 0;
 
     void
     operator()(void *ptr) const noexcept;
@@ -73,11 +74,12 @@ public:
     /**
      * @brief Allocate pinned host memory with a device-visible alias.
      * @param[out] out Owning handle; unchanged on failure.
+     * @param numa_node Host NUMA node to place it on when the backend can; -1 for no preference.
      * @retval NIXL_ERR_INVALID_PARAM size is zero.
      * @note This instance must outlive the returned handle.
      */
     [[nodiscard]] nixl_status_t
-    allocMappedHostMem(size_t size, mappedHostMem &out) noexcept;
+    allocMappedHostMem(size_t size, mappedHostMem &out, int numa_node = -1) noexcept;
 
     /**
      * @brief Allocate zeroed memory the CPU publishes words into and the GPU reads.
@@ -85,12 +87,15 @@ public:
      * Prefers device memory the CPU writes directly, which keeps GPU polling local, and
      * falls back to mapped host memory.
      * @param[out] out Owning handle; unchanged on failure.
+     * @param numa_node NUMA node for the mapped host fallback; -1 for no preference.
      * @retval NIXL_ERR_INVALID_PARAM size is zero.
      * @note Only kernels on the device active at allocation may read it, whatever the backing.
      * @note This instance must outlive the returned handle.
      */
     [[nodiscard]] nixl_status_t
-    allocHostPublishedMem(size_t size, std::unique_ptr<hostPublishedDeviceMem> &out) noexcept;
+    allocHostPublishedMem(size_t size,
+                          std::unique_ptr<hostPublishedDeviceMem> &out,
+                          int numa_node = -1) noexcept;
 
     /**
      * @brief Copy between host and device memory using the default stream.
@@ -122,6 +127,27 @@ public:
     [[nodiscard]] virtual nixl_status_t
     setActiveDevice(int device_id) noexcept = 0;
 
+    /**
+     * @brief Get the host NUMA node closest to `device_id`.
+     * @retval NIXL_ERR_NOT_SUPPORTED The backend or system cannot tell; `node` is unchanged.
+     */
+    [[nodiscard]] virtual nixl_status_t
+    getHostNumaNode(int, int &) noexcept {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    /** @brief Host NUMA node closest to the calling thread's active device, or -1. */
+    [[nodiscard]] int
+    activeHostNumaNode() noexcept {
+        int device;
+        int node;
+        if (getActiveDevice(device) != NIXL_SUCCESS ||
+            getHostNumaNode(device, node) != NIXL_SUCCESS) {
+            return -1;
+        }
+        return node;
+    }
+
 protected:
     /** @brief Allocate device storage, assigning ptr only on success. */
     [[nodiscard]] virtual nixl_status_t
@@ -131,13 +157,21 @@ protected:
     virtual void
     doFreeDeviceMem(void *ptr) noexcept = 0;
 
-    /** @brief Allocate mapped host storage, assigning both pointers only on success. */
+    /**
+     * @brief Allocate mapped host storage, assigning the outputs only on success.
+     * @param numa_node Host NUMA node to place it on when possible; -1 for no preference.
+     * @param[out] length What doFreeMappedHostMem must be given back.
+     */
     [[nodiscard]] virtual nixl_status_t
-    doAllocMappedHostMem(void *&host_ptr, void *&dev_ptr, size_t size) noexcept = 0;
+    doAllocMappedHostMem(void *&host_ptr,
+                         void *&dev_ptr,
+                         size_t size,
+                         int numa_node,
+                         size_t &length) noexcept = 0;
 
     /** @brief Free the host allocation, not its device alias; no device switch required. */
     virtual void
-    doFreeMappedHostMem(void *host_ptr) noexcept = 0;
+    doFreeMappedHostMem(void *host_ptr, size_t length) noexcept = 0;
 
     /**
      * @brief Allocate zeroed device memory the CPU can publish into directly.
@@ -160,7 +194,7 @@ deviceMemDeleter::operator()(void *ptr) const noexcept {
 
 inline void
 mappedHostMemDeleter::operator()(void *ptr) const noexcept {
-    ops->doFreeMappedHostMem(ptr);
+    ops->doFreeMappedHostMem(ptr, length);
 }
 
 /** @brief Owns pinned host memory and exposes its non-owning device alias. */
@@ -193,8 +227,8 @@ public:
 private:
     friend class deviceOps;
 
-    mappedHostMem(deviceOps *ops, void *host_ptr, void *dev_ptr) noexcept
-        : hostPtr_(host_ptr, mappedHostMemDeleter{ops}),
+    mappedHostMem(deviceOps *ops, void *host_ptr, void *dev_ptr, size_t length) noexcept
+        : hostPtr_(host_ptr, mappedHostMemDeleter{ops, length}),
           devPtr_(dev_ptr) {}
 
     std::unique_ptr<void, mappedHostMemDeleter> hostPtr_;

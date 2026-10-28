@@ -27,6 +27,7 @@ nixl_common_deps = [
     absl_synchronization_dep,
     tomlplusplus_dep,
     dependency('asio', required: true),
+    thread_dep,
 ]
 
 # Get git commit hash
@@ -36,6 +37,7 @@ git_commit = git_hash.returncode() == 0 ? git_hash.stdout().strip() : 'unknown'
 # Define a shared library for common utilities
 nixl_common_lib = shared_library('nixl_common',
     'hw_info.cpp',
+    files('../thread_affinity.cpp'),
     'nixl_log.cpp',
     'nixl_log_file_sink.cpp',
     'uuid_v4.cpp',

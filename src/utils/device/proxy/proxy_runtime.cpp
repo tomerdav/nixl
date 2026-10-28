@@ -47,7 +47,8 @@ proxyRuntime::create(std::unique_ptr<proxyTransport> transport,
                      deviceOps &allocator) {
     NIXL_INFO << "ProxyRuntime::create: max_peers=" << config.max_peers
               << " channel_count=" << config.channel_count
-              << " thread_count=" << config.thread_count << " ring_depth=" << config.ring_depth;
+              << " thread_count=" << config.thread_count << " ring_depth=" << config.ring_depth
+              << " numa_bind=" << config.numa_bind;
 
     if (!transport) {
         throwRuntimeError("ProxyRuntime::create: no transport");
@@ -88,7 +89,12 @@ proxyRuntime::build() {
         return NIXL_ERR_INVALID_PARAM;
     }
     const size_t device_channel_views_bytes = sizeof(nixlProxyRingDesc) * channel_slots;
-    nixl_status_t rc = proxyControlBuffer::create(allocator_, channel_slots, control_slots_);
+    const int numa_node = config_.numa_bind ? allocator_.activeHostNumaNode() : -1;
+    if (numa_node >= 0) {
+        NIXL_INFO << "Proxy threads and rings bind to NUMA node " << numa_node;
+    }
+    nixl_status_t rc =
+        proxyControlBuffer::create(allocator_, channel_slots, control_slots_, numa_node);
     if (rc != NIXL_SUCCESS) {
         NIXL_ERROR << "ProxyRuntime::build: failed to create GPU-visible control slab";
         return rc;
@@ -100,7 +106,7 @@ proxyRuntime::build() {
     device_channel_views.reserve(channel_slots);
     for (uint32_t channel_idx = 0; channel_idx < channel_count; channel_idx++) {
         channels_.emplace_back(channel_idx, max_peers);
-        rc = channels_.back().allocate(allocator_, config_.ring_depth, *control_slots_);
+        rc = channels_.back().allocate(allocator_, config_.ring_depth, *control_slots_, numa_node);
         if (rc != NIXL_SUCCESS) {
             return rc;
         }
@@ -133,7 +139,7 @@ proxyRuntime::build() {
     memview_manager_ = std::make_unique<proxyMemViewManager>(allocator_, deviceContext());
 
     worker_context_ = std::make_unique<const proxyWorkerContext>(proxyWorkerContext{
-        *transport_, drain_requested_, shutting_down_, stop_source_.get_token()});
+        *transport_, drain_requested_, shutting_down_, stop_source_.get_token(), numa_node});
     workers_.reserve(worker_count);
     for (uint32_t worker_idx = 0; worker_idx < worker_count; worker_idx++) {
         const proxyThreadShare share = config_.threadShare(worker_idx);

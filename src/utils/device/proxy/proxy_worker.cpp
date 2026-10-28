@@ -16,8 +16,12 @@
  */
 #include "proxy_worker.h"
 #include "nixl_log.h"
+#include "thread_affinity.h"
+
+#include <pthread.h>
 
 #include <exception>
+#include <string>
 
 namespace nixl {
 
@@ -39,6 +43,7 @@ proxyWorker::start() noexcept {
     try {
         thread_ = std::jthread([this]() {
             selectOwnedDevice();
+            bindToNumaNode();
             while (!ctx_.stop.stop_requested()) {
                 runOnce();
             }
@@ -66,6 +71,15 @@ proxyWorker::selectOwnedDevice() noexcept {
     const proxyRing &ring = channels_.front().ring(peers_.first);
     if (ring.allocated() && ring.selectDevice() != NIXL_SUCCESS) {
         NIXL_FATAL << "Failed to select proxy ring device";
+    }
+}
+
+void
+proxyWorker::bindToNumaNode() noexcept {
+    pthread_setname_np(pthread_self(), ("nixl-proxy-" + std::to_string(index_)).c_str());
+    if (ctx_.numa_node >= 0 && bindThreadToNumaNode(ctx_.numa_node) != NIXL_SUCCESS) {
+        NIXL_DEBUG << "Proxy worker " << index_ << " not fully bound to NUMA node "
+                   << ctx_.numa_node;
     }
 }
 

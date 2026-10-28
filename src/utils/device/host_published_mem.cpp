@@ -47,7 +47,8 @@ namespace {
 
 nixl_status_t
 deviceOps::allocHostPublishedMem(size_t size,
-                                 std::unique_ptr<hostPublishedDeviceMem> &out) noexcept {
+                                 std::unique_ptr<hostPublishedDeviceMem> &out,
+                                 int numa_node) noexcept {
     if (size == 0) {
         NIXL_ERROR << "Host-published allocation requires nonzero size";
         return NIXL_ERR_INVALID_PARAM;
@@ -57,7 +58,7 @@ deviceOps::allocHostPublishedMem(size_t size,
     }
 
     mappedHostMem mem;
-    const nixl_status_t status = allocMappedHostMem(size, mem);
+    const nixl_status_t status = allocMappedHostMem(size, mem, numa_node);
     if (status != NIXL_SUCCESS) {
         return status;
     }

@@ -685,6 +685,7 @@ def main():
     if args.kineto and not kineto_cuda_available(0):
         raise SystemExit("Kineto profiling was requested but is not supported")
 
+    os.environ.setdefault("LOCAL_WORLD_SIZE", str(args.num_processes))
     if args.num_processes == 1:
         worker(0, args)
         return

@@ -42,6 +42,8 @@ struct proxyWorkerContext {
     const std::atomic<bool> &shutting_down;
     /** From the runtime's stop source; requested once, after the final drain. */
     std::stop_token stop;
+    /** Host NUMA node the workers bind to, or -1 to keep the inherited affinity. */
+    int numa_node = -1;
 };
 
 class proxyWorker {
@@ -70,6 +72,10 @@ private:
     /** Make the first owned ring's device current, so every transport call runs on it. */
     void
     selectOwnedDevice() noexcept;
+
+    /** Name the thread and bind it to the context's NUMA node, if any. */
+    void
+    bindToNumaNode() noexcept;
 
     void
     runOnce();

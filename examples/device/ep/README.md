@@ -14,6 +14,7 @@ NIXL EP is a complete example implementation of expert-parallel communication fo
 - `NIXL_EP_DEVICE_MODE`: `direct` (default) or `proxy`. There is no fallback: if the selected path is unavailable, EP fails.
 - `NIXL_EP_NUM_CHANNELS`: the number of channels (default 4).
 - `NIXL_EP_PROXY_THREADS`: the number of proxy threads (default: the number of channels).
+- Proxy threads busy-poll on the CPUs of their GPU's NUMA node. Keep ranks on that node × proxy threads within its physical cores; rank 0 warns otherwise. Set `LOCAL_WORLD_SIZE` to the ranks per host for an exact count; without it, every GPU on the node counts as one rank.
 
 ## Buffer Initialization
 

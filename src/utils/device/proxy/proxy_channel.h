@@ -45,7 +45,7 @@ public:
     /** Allocate every peer's ring; ring (id, peer) takes control-buffer ring id * max_peers + peer.
      */
     [[nodiscard]] nixl_status_t
-    allocate(deviceOps &allocator, uint32_t depth, proxyControlBuffer &control);
+    allocate(deviceOps &allocator, uint32_t depth, proxyControlBuffer &control, int numa_node);
 
     [[nodiscard]] uint32_t
     id() const noexcept {
