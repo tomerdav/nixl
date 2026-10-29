@@ -522,6 +522,10 @@ endif
 if get_option('buildtype') == 'release'
     # Used by Abseil to strip DCHECK assertions and DVLOG at compile time
     add_project_arguments('-DNDEBUG', language: 'cpp')
+    # Device asserts sit on the device API's per-op path
+    if cuda_dep.found()
+        add_project_arguments('-DNDEBUG', language: 'cuda')
+    endif
 endif
 
 # ---- Tracing (nixl::trace) -------------------------------------------------

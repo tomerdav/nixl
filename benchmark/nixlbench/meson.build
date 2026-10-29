@@ -248,6 +248,10 @@ elif nvshmem_available
 else
     add_languages('cuda', native: false)
     add_project_arguments('-std=c++20', language: 'cuda')
+    # Device asserts sit on the device API's per-op path
+    if get_option('buildtype') == 'release'
+        add_project_arguments('-DNDEBUG', language: 'cuda')
+    endif
     cuda = meson.get_compiler('cuda')
     if not cuda.version().version_compare('>=12.8')
         message(
